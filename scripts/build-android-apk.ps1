@@ -10,9 +10,9 @@ Write-Host "  TeleCloud Android APK Packaging Pipeline" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 1. Configure Android Toolchain Environment
-$isWindows = ($env:OS -eq "Windows_NT") -or ($PSVersionTable.Platform -eq "Win32NT")
+$runningOnWindows = if ($null -ne $IsWindows) { [bool]$IsWindows } else { ($env:OS -eq "Windows_NT") }
 
-if (-not $isWindows) {
+if (-not $runningOnWindows) {
     # Linux / CI environment
     $SdkDir = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { "/usr/local/lib/android/sdk" }
     
@@ -93,7 +93,7 @@ if (-not (Test-Path $AndroidAssetsDir)) {
 Copy-Item (Join-Path $RootDir "dist/*") $AndroidAssetsDir -Recurse -Force
 
 # Ensure launcher icons are properly safe-zoned and copied to Android res directory
-if ($isWindows) {
+if ($runningOnWindows) {
     try {
         & (Join-Path $ScriptDir "generate-android-icons.ps1")
     } catch {
@@ -112,7 +112,7 @@ if (-not (Test-Path $LocalProp) -and $env:ANDROID_HOME) {
     "sdk.dir=$($env:ANDROID_HOME -replace '\\', '/')" | Set-Content -Path $LocalProp
 }
 Set-Location $GradleDir
-if (-not $isWindows -and (Test-Path (Join-Path $GradleDir "gradlew"))) {
+if (-not $runningOnWindows -and (Test-Path (Join-Path $GradleDir "gradlew"))) {
     chmod +x (Join-Path $GradleDir "gradlew")
 }
 & $Gradlew assembleArm64Release -x rustBuildArm64Release -x rustBuildArmRelease
