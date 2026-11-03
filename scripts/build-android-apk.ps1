@@ -28,7 +28,7 @@ if (-not $isWindows) {
     $NdkBin = "$NdkDir/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
     $env:ANDROID_HOME = $SdkDir
-    $env:PATH = "$NdkBin:$SdkDir/platform-tools:$SdkDir/cmdline-tools/latest/bin:$env:PATH"
+    $env:PATH = @($NdkBin, "$SdkDir/platform-tools", "$SdkDir/cmdline-tools/latest/bin", $env:PATH) -join [System.IO.Path]::PathSeparator
 
     $env:CC_aarch64_linux_android = "$NdkBin/aarch64-linux-android24-clang"
     $env:AR_aarch64_linux_android = "$NdkBin/llvm-ar"
