@@ -1,0 +1,147 @@
+name: TeleCloud Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Set up Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Frontend Dependencies
+        run: |
+          npm install
+          cd installer
+          npm install
+
+      - name: Execute Custom Windows Build & Installer Script
+        shell: powershell
+        run: |
+          .\scripts\build-windows-installer.ps1
+
+      - name: Verify Output Binaries
+        shell: powershell
+        run: |
+          if (-not (Test-Path "release\TeleCloud-1.0.0-Setup.exe")) {
+            throw "Expected release\TeleCloud-1.0.0-Setup.exe was not generated"
+          }
+          if (-not (Test-Path "release\TeleCloud.exe")) {
+            throw "Expected release\TeleCloud.exe was not generated"
+          }
+          Get-Item release\*
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            release/TeleCloud-1.0.0-Setup.exe
+            release/TeleCloud.exe
+          if-no-files-found: error
+
+  build-android:
+    name: Build Android Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK & Platform Tools
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+
+      - name: Set up Node.js LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Set up Rust & Android Compilation Targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Install Frontend Dependencies
+        run: npm install
+
+      - name: Execute Custom Android APK Build Script
+        shell: pwsh
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          NDK_HOME: /usr/local/lib/android/sdk/ndk/26.1.10909125
+        run: |
+          ./scripts/build-android-apk.ps1
+
+      - name: Verify Output APK
+        shell: pwsh
+        run: |
+          $apks = Get-ChildItem -Path release -Filter "*.apk"
+          if ($apks.Count -eq 0) {
+            throw "No APK files found in release directory"
+          }
+          Get-Item release/*
+
+      - name: Upload Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: release/*.apk
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binaries
+          path: release-windows
+
+      - name: Download Android Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: release-android
+
+      - name: Publish GitHub Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            release-windows/*
+            release-android/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
