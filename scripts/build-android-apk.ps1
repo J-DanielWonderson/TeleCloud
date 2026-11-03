@@ -33,6 +33,7 @@ if (-not $isWindows) {
     $env:CC_aarch64_linux_android = "$NdkBin/aarch64-linux-android24-clang"
     $env:AR_aarch64_linux_android = "$NdkBin/llvm-ar"
     $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$NdkBin/aarch64-linux-android24-clang"
+    $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_AR = "$NdkBin/llvm-ar"
     $Gradlew = "./gradlew"
 } else {
     # Windows environment
@@ -106,6 +107,10 @@ Copy-Item $IconSrc $IconDst -Recurse -Force
 # 5. Run Gradle Build
 Write-Host "`n[4/5] Executing Gradle APK packaging (assembleArm64Release)..." -ForegroundColor Yellow
 $GradleDir = Join-Path $RootDir "src-tauri/gen/android"
+$LocalProp = Join-Path $GradleDir "local.properties"
+if (-not (Test-Path $LocalProp) -and $env:ANDROID_HOME) {
+    "sdk.dir=$($env:ANDROID_HOME -replace '\\', '/')" | Set-Content -Path $LocalProp
+}
 Set-Location $GradleDir
 if (-not $isWindows -and (Test-Path (Join-Path $GradleDir "gradlew"))) {
     chmod +x (Join-Path $GradleDir "gradlew")

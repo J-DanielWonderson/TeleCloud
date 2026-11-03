@@ -69,13 +69,23 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android NDK & Platform Tools
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+          SDKMANAGER_BIN=""
+          if command -v sdkmanager >/dev/null 2>&1; then
+            SDKMANAGER_BIN="sdkmanager"
+          elif [ -f "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER_BIN="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          elif [ -f "$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager" ]; then
+            SDKMANAGER_BIN="$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager"
+          else
+            SDKMANAGER_BIN=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1)
+          fi
+          echo "Using sdkmanager at: $SDKMANAGER_BIN"
+          yes | "$SDKMANAGER_BIN" --licenses || true
+          "$SDKMANAGER_BIN" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 
       - name: Set up Node.js LTS
         uses: actions/setup-node@v4
