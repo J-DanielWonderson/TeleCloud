@@ -1,0 +1,23 @@
+{
+  "name": "telecloud-feedback-relay",
+  "version": "1.0.0",
+  "description": "Secure serverless relay for TeleCloud user feedback delivery to GitHub Issues",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "cloudflare-worker",
+    "github-issues",
+    "feedback-relay"
+  ],
+  "author": "TeleCloud",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240405.0",
+    "typescript": "^5.4.5",
+    "wrangler": "^3.50.0"
+  }
+}

@@ -1,0 +1,10 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme with Zero-White-Flash dark background -->
+    <style name="Theme.telecloud_vault" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">#06090e</item>
+        <item name="android:statusBarColor">#06090e</item>
+        <item name="android:navigationBarColor">#06090e</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+</resources>

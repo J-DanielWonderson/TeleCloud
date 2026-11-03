@@ -1,0 +1,5 @@
+target/
+*.db
+*.exe
+*.dll
+bin/

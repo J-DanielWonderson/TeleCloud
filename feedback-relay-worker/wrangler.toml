@@ -1,0 +1,13 @@
+name = "telecloud-feedback-relay"
+main = "src/index.ts"
+compatibility_date = "2024-04-01"
+
+[vars]
+# Replace these with your target GitHub repository details:
+GITHUB_REPO_OWNER = "J-DanielWonderson"
+GITHUB_REPO_NAME = "TeleCloud"
+ALLOWED_ORIGIN = "*"
+
+# Secrets (DO NOT put real tokens here!):
+# Set securely via Cloudflare Wrangler CLI:
+#   npx wrangler secret put GITHUB_TOKEN

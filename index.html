@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en" class="dark" style="background-color: #06090e; color-scheme: dark;">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/32x32.png" />
+    <link rel="shortcut icon" href="/32x32.png" />
+    <link rel="apple-touch-icon" href="/icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#06090e" />
+    <meta name="color-scheme" content="dark" />
+    <title>TeleCloud — Unlimited Cloud Storage</title>
+    <style>
+      html, body, #root {
+        background-color: #06090e !important;
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .preloader {
+        position: fixed;
+        inset: 0;
+        background-color: #06090e;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        z-index: 9999;
+      }
+      .preloader-glow {
+        width: 52px;
+        height: 52px;
+        border-radius: 16px;
+        background: linear-gradient(135deg, rgba(6, 182, 212, 0.2), rgba(59, 130, 246, 0.2));
+        border: 1px solid rgba(6, 182, 212, 0.35);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 0 25px rgba(6, 182, 212, 0.25);
+        animation: pulsePre 1.8s infinite ease-in-out;
+      }
+      .preloader-dot {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background-color: #00d2ff;
+        box-shadow: 0 0 10px #00d2ff;
+      }
+      @keyframes pulsePre {
+        0%, 100% { transform: scale(1); opacity: 0.9; }
+        50% { transform: scale(1.06); opacity: 0.6; }
+      }
+    </style>
+  </head>
+  <body class="bg-vault-950 text-slate-100 antialiased select-none overflow-hidden" style="background-color: #06090e;">
+    <div id="root" style="background-color: #06090e;">
+      <div class="preloader">
+        <div class="preloader-glow">
+          <div class="preloader-dot"></div>
+        </div>
+        <span style="font-family: monospace; font-size: 11px; color: #38bdf8; letter-spacing: 0.1em;">TeleCloud</span>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

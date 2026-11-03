@@ -1,0 +1,146 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Background Vibrant Telegram Azure Gradient -->
+    <linearGradient id="circleGrad" x1="180" y1="100" x2="840" y2="920" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#38bdf8" />
+      <stop offset="40%" stopColor="#0284c7" />
+      <stop offset="100%" stopColor="#075985" />
+    </linearGradient>
+
+    <!-- Outer Rim Subtle Bevel Highlight -->
+    <linearGradient id="rimGrad" x1="512" y1="40" x2="512" y2="984" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#ffffff" stopOpacity="0.45" />
+      <stop offset="60%" stopColor="#38bdf8" stopOpacity="0.1" />
+      <stop offset="100%" stopColor="#0369a1" stopOpacity="0.5" />
+    </linearGradient>
+
+    <!-- Cloud Solid Body Gradient -->
+    <linearGradient id="cloudBodyGrad" x1="512" y1="310" x2="512" y2="740" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#ffffff" />
+      <stop offset="70%" stopColor="#f0f9ff" />
+      <stop offset="100%" stopColor="#e0f2fe" />
+    </linearGradient>
+
+    <!-- Cloud Bottom Depth Shadow -->
+    <linearGradient id="cloudBaseGrad" x1="512" y1="620" x2="512" y2="730" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#bae6fd" stopOpacity="0.4" />
+      <stop offset="100%" stopColor="#7dd3fc" stopOpacity="0.9" />
+    </linearGradient>
+
+    <!-- Telegram Paper Plane Wing Main -->
+    <linearGradient id="planeMain" x1="380" y1="440" x2="720" y2="600" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0284c7" />
+      <stop offset="100%" stopColor="#0369a1" />
+    </linearGradient>
+
+    <!-- Telegram Paper Plane Wing Right -->
+    <linearGradient id="planeRight" x1="500" y1="460" x2="720" y2="580" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#38bdf8" />
+      <stop offset="100%" stopColor="#0ea5e9" />
+    </linearGradient>
+
+    <!-- Telegram Paper Plane Wing Fold Keel -->
+    <linearGradient id="planeKeel" x1="490" y1="560" x2="560" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#075985" />
+      <stop offset="100%" stopColor="#0c4a6e" />
+    </linearGradient>
+
+    <!-- Subtle Drop Shadow for Cloud -->
+    <filter id="cloudShadow" x="-10%" y="-10%" width="120%" height="125%" filterUnits="objectBoundingBox">
+      <feDropShadow dx="0" dy="18" stdDeviation="16" flood-color="#023e8a" flood-opacity="0.35" />
+    </filter>
+  </defs>
+
+  <!-- 1. Vibrant Background Circle (Stands out boldly on ANY taskbar: dark, light, transparent) -->
+  <circle
+    cx="512"
+    cy="512"
+    r="470"
+    fill="url(#circleGrad)"
+    stroke="url(#rimGrad)"
+    stroke-width="12"
+  />
+
+  <!-- 2. Solid, Chunky Opaque White Cloud (Zero thin strokes, zero dark transparency) -->
+  <path
+    d="M 320 720 
+       L 720 720 
+       C 800 720 860 660 860 580 
+       C 860 505 805 450 735 445 
+       C 725 350 645 280 545 280 
+       C 460 280 388 335 365 415 
+       C 350 410 335 408 320 408 
+       C 240 408 175 473 175 553 
+       C 175 645 240 720 320 720 Z"
+    fill="url(#cloudBodyGrad)"
+    filter="url(#cloudShadow)"
+  />
+
+  <!-- Cloud Base Shading for Volume & 3D Tactility -->
+  <path
+    d="M 230 630 
+       C 260 690 320 720 380 720 
+       L 720 720 
+       C 780 720 840 670 855 610 
+       C 820 655 760 680 700 680 
+       L 340 680 
+       C 280 680 245 655 230 630 Z"
+    fill="url(#cloudBaseGrad)"
+  />
+
+  <!-- 3. Supersonic Paper Plane Soaring from the Cloud (High-Contrast Telegram Blue on White Cloud) -->
+  <!-- Left Main Wing -->
+  <path
+    d="M 340 545 
+       L 750 380 
+       L 550 700 
+       L 485 575 Z"
+    fill="url(#planeMain)"
+  />
+
+  <!-- Right Wing Fold -->
+  <path
+    d="M 750 380 
+       L 485 575 
+       L 645 620 Z"
+    fill="url(#planeRight)"
+  />
+
+  <!-- Keel Bottom Crease -->
+  <path
+    d="M 485 575 
+       L 535 650 
+       L 550 700 Z"
+    fill="url(#planeKeel)"
+  />
+
+  <!-- Crisp Wing Center Ridge Highlight -->
+  <path
+    d="M 340 545 L 750 380"
+    stroke="#ffffff"
+    stroke-width="7"
+    stroke-linecap="round"
+    opacity="0.85"
+  />
+
+  <!-- Dynamic Speed Streaks (Solid White with clean opacity) -->
+  <path
+    d="M 270 575 L 340 545"
+    stroke="#ffffff"
+    stroke-width="12"
+    stroke-linecap="round"
+    opacity="0.9"
+  />
+  <path
+    d="M 240 610 L 325 575"
+    stroke="#e0f2fe"
+    stroke-width="9"
+    stroke-linecap="round"
+    opacity="0.75"
+  />
+
+  <!-- Status Activity Nodes on Circle Rim -->
+  <circle cx="512" cy="850" r="16" fill="#22c55e" />
+  <circle cx="456" cy="848" r="12" fill="#bae6fd" opacity="0.9" />
+  <circle cx="568" cy="848" r="12" fill="#bae6fd" opacity="0.9" />
+</svg>

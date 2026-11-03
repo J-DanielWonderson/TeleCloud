@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TeleCloud",
+        "fullscreen": true,
+        "resizable": true,
+        "visible": true
+      }
+    ]
+  }
+}
