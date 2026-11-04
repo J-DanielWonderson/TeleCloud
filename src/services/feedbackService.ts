@@ -35,6 +35,7 @@ export interface FeedbackResponse {
 
 const STORAGE_KEY_CUSTOM_RELAY = 'telecloud_feedback_relay_url';
 export const APP_VERSION = '1.0.0';
+export const DEFAULT_FEEDBACK_RELAY_URL = 'https://telecloud-feedback-relay.telegramcloud.workers.dev/api/feedback';
 
 /**
  * Detect client operating system and hardware characteristics
@@ -102,7 +103,7 @@ export function getClientMetadata(): ClientMetadata {
 export function getFeedbackRelayUrl(): string {
   try {
     const saved = localStorage.getItem(STORAGE_KEY_CUSTOM_RELAY);
-    if (saved && saved.trim()) {
+    if (saved && saved.trim() && !saved.includes('YOUR_WORKER_SUBDOMAIN')) {
       return saved.trim();
     }
   } catch {
@@ -114,7 +115,7 @@ export function getFeedbackRelayUrl(): string {
     return envUrl.trim();
   }
 
-  return '';
+  return DEFAULT_FEEDBACK_RELAY_URL;
 }
 
 /**

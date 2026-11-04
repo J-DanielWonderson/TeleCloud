@@ -5,6 +5,7 @@ import {
   getFeedbackRelayUrl,
   setFeedbackRelayUrl,
   isRelayUrlConfigured,
+  DEFAULT_FEEDBACK_RELAY_URL,
   FeedbackCategory,
   ClientMetadata,
   FeedbackResponse,
@@ -117,7 +118,18 @@ export const FeedbackModal: React.FC<FeedbackModalProps> = ({ isOpen, onClose })
   const handleSaveRelayUrl = (e: React.FormEvent) => {
     e.preventDefault();
     setFeedbackRelayUrl(customRelayInput.trim());
-    setRelayUrl(getFeedbackRelayUrl());
+    const updated = getFeedbackRelayUrl();
+    setRelayUrl(updated);
+    setCustomRelayInput(updated);
+    setShowRelaySettings(false);
+    setError(null);
+  };
+
+  const handleResetDefaultRelay = () => {
+    setFeedbackRelayUrl(null);
+    const updated = getFeedbackRelayUrl();
+    setRelayUrl(updated);
+    setCustomRelayInput(updated);
     setShowRelaySettings(false);
     setError(null);
   };
@@ -299,7 +311,7 @@ export const FeedbackModal: React.FC<FeedbackModalProps> = ({ isOpen, onClose })
                       type="url"
                       value={customRelayInput}
                       onChange={(e) => setCustomRelayInput(e.target.value)}
-                      placeholder="https://telecloud-feedback-relay.<subdomain>.workers.dev/api/feedback"
+                      placeholder={DEFAULT_FEEDBACK_RELAY_URL}
                       className="flex-1 bg-vault-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 font-mono"
                     />
                     <button
@@ -309,6 +321,16 @@ export const FeedbackModal: React.FC<FeedbackModalProps> = ({ isOpen, onClose })
                     >
                       Save
                     </button>
+                    {relayUrl !== DEFAULT_FEEDBACK_RELAY_URL && (
+                      <button
+                        type="button"
+                        onClick={handleResetDefaultRelay}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium border border-slate-700 transition"
+                        title="Reset to default official relay"
+                      >
+                        Reset
+                      </button>
+                    )}
                   </div>
                   <div className="flex items-center justify-between text-[10px] text-slate-500">
                     <span>Saved in local client storage.</span>

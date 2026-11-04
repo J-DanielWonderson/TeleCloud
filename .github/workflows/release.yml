@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  VITE_FEEDBACK_RELAY_URL: https://telecloud-feedback-relay.telegramcloud.workers.dev/api/feedback
+
 jobs:
   build-windows:
     name: Build Windows Release

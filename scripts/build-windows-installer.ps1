@@ -5,6 +5,9 @@
 
 $ErrorActionPreference = "Stop"
 $env:CARGO_BUILD_JOBS = "1"
+if (-not $env:VITE_FEEDBACK_RELAY_URL) {
+    $env:VITE_FEEDBACK_RELAY_URL = "https://telecloud-feedback-relay.telegramcloud.workers.dev/api/feedback"
+}
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Split-Path -Parent $ScriptDir
 
