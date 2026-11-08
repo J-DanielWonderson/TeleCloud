@@ -13,6 +13,7 @@ use db::cloud_sync::CloudSyncManager;
 use db::schema::DbManager;
 use engine::chunk_merger::ChunkMergerManager;
 use engine::chunk_uploader::ChunkUploaderManager;
+use engine::preview_stream::{self, PreviewStreamManager};
 use telegram::bot_pool::BotPool;
 use telegram::client::TelegramClientManager;
 use vault::keystore::Keystore;
@@ -74,16 +75,35 @@ pub fn run() {
                 Arc::clone(&bot_pool),
                 Arc::clone(&tg),
             ));
+            let preview_mgr = Arc::new(
+                tauri::async_runtime::block_on(PreviewStreamManager::new(
+                    app_handle,
+                    Arc::clone(&db),
+                    Arc::clone(&bot_pool),
+                    Arc::clone(&tg),
+                ))?
+            );
+
+            let p_init = Arc::clone(&preview_mgr);
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = preview_stream::start_preview_server(p_init).await {
+                    eprintln!("Failed to start preview stream server: {e}");
+                }
+            });
 
             // Background task: initialize stored worker bots and continuous real-time cloud VFS sync loop
             let pool_init = Arc::clone(&bot_pool);
             let sync_init = Arc::clone(&cloud_sync);
             let tg_init = Arc::clone(&tg);
+            let preview_init = Arc::clone(&preview_mgr);
             let app_handle_bg = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = pool_init.initialize_from_db().await {
                     eprintln!("Bot pool initialization error: {e}");
                 }
+
+                // Background DC pre-warming for instant first video open
+                preview_init.warm_up_active_bots().await;
 
                 // Initial sync
                 if let Ok(true) = tg_init.is_authorized().await {
@@ -120,6 +140,7 @@ pub fn run() {
             app.manage(cloud_sync);
             app.manage(uploader);
             app.manage(merger);
+            app.manage(preview_mgr);
 
             eprintln!("===> SETUP HOOK COMPLETED SUCCESSFULLY");
             Ok(())
@@ -167,7 +188,18 @@ pub fn run() {
             commands::resume_download,
             commands::cancel_download,
             commands::get_default_download_directory,
-            commands::request_android_permissions
+            commands::request_android_permissions,
+            commands::get_preview_stream_url,
+            commands::get_preview_thumbnail_url,
+            commands::get_file_thumbnail,
+            commands::save_file_thumbnail,
+            commands::get_file_preview_text,
+            commands::probe_media,
+            commands::prepare_preview,
+            commands::cancel_preview,
+            commands::clear_preview_cache,
+            commands::open_native_player,
+            commands::open_external_player
         ])
         .run(tauri::generate_context!())
         .expect("error while running TeleCloud Vault application");

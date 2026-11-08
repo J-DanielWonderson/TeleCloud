@@ -52,7 +52,7 @@ export const TelegramDriveLogo: React.FC<TelegramDriveLogoProps> = ({
               Cloud
             </span>
             <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-              v1.0.0
+              v1.1.3
             </span>
           </div>
           {subtitle && (

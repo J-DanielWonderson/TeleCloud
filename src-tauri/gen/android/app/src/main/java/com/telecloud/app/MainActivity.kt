@@ -94,6 +94,38 @@ class MainActivity : TauriActivity() {
         }
 
         @JvmStatic
+        fun openNativePlayer(url: String, title: String) {
+            val ctx = instance ?: return
+            try {
+                val intent = Intent(ctx, NativePlayerActivity::class.java).apply {
+                    putExtra("STREAM_URL", url)
+                    putExtra("TITLE", title)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                ctx.startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to launch NativePlayerActivity: ${e.message}", e)
+            }
+        }
+
+        @JvmStatic
+        fun openInExternalPlayer(url: String, mime: String, title: String) {
+            val ctx = instance ?: return
+            try {
+                val uri = Uri.parse(url)
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, if (mime.isEmpty()) "video/*" else mime)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                val chooser = Intent.createChooser(intent, "Play with external video player")
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(chooser)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to open in external player: ${e.message}", e)
+            }
+        }
+
+        @JvmStatic
         fun scanMediaFile(path: String) {
             val ctx = instance ?: return
             try {

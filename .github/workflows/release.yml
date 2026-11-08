@@ -42,8 +42,9 @@ jobs:
       - name: Verify Output Binaries
         shell: powershell
         run: |
-          if (-not (Test-Path "release\TeleCloud-1.0.0-Setup.exe")) {
-            throw "Expected release\TeleCloud-1.0.0-Setup.exe was not generated"
+          $setups = Get-ChildItem -Path release -Filter "TeleCloud-*-Setup.exe"
+          if ($setups.Count -eq 0) {
+            throw "Expected release\TeleCloud-*-Setup.exe was not generated"
           }
           if (-not (Test-Path "release\TeleCloud.exe")) {
             throw "Expected release\TeleCloud.exe was not generated"
@@ -55,7 +56,7 @@ jobs:
         with:
           name: windows-binaries
           path: |
-            release/TeleCloud-1.0.0-Setup.exe
+            release/TeleCloud-*-Setup.exe
             release/TeleCloud.exe
           if-no-files-found: error
 
@@ -86,7 +87,7 @@ jobs:
           fi
           echo "Using sdkmanager at: $SDKMANAGER_BIN"
           yes | "$SDKMANAGER_BIN" --licenses || true
-          "$SDKMANAGER_BIN" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+          "$SDKMANAGER_BIN" "platforms;android-34" "platforms;android-36" "build-tools;34.0.0" "ndk;26.1.10909125"
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 

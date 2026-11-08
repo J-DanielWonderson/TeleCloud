@@ -92,6 +92,11 @@ Copy-Item $CompiledSo (Join-Path $JniLibsDir "libtelecloud_vault_lib.so") -Force
 $AndroidAssetsDir = Join-Path $RootDir "src-tauri/gen/android/app/src/main/assets"
 if (-not (Test-Path $AndroidAssetsDir)) {
     New-Item -ItemType Directory -Force -Path $AndroidAssetsDir | Out-Null
+} else {
+    $StaleAssets = Join-Path $AndroidAssetsDir "assets"
+    if (Test-Path $StaleAssets) {
+        Remove-Item -Recurse -Force $StaleAssets
+    }
 }
 Copy-Item (Join-Path $RootDir "dist/*") $AndroidAssetsDir -Recurse -Force
 
@@ -133,14 +138,12 @@ dependencies {
 }
 
 $TauriProperties = Join-Path $RootDir "src-tauri/gen/android/app/tauri.properties"
-if (-not (Test-Path $TauriProperties)) {
-    $tauriPropsContent = @"
-tauri.android.versionName=1.0.0
-tauri.android.versionCode=1000000
+$tauriPropsContent = @"
+tauri.android.versionName=1.1.3
+tauri.android.versionCode=1001003
 "@
-    Set-Content -Path $TauriProperties -Value $tauriPropsContent -Encoding UTF8
-    Write-Host "Generated app/tauri.properties" -ForegroundColor Yellow
-}
+Set-Content -Path $TauriProperties -Value $tauriPropsContent -Encoding UTF8
+Write-Host "Updated app/tauri.properties (v1.1.3)" -ForegroundColor Yellow
 
 # Ensure tauri.settings.gradle exists with absolute paths for the current machine
 $TauriSettingsPath = Join-Path $GradleDir "tauri.settings.gradle"
@@ -195,7 +198,7 @@ if (-not (Test-Path $ApkSource)) {
     }
 }
 
-$FinalApk = Join-Path $ReleaseDir "TeleCloud-1.0.0-arm64.apk"
+$FinalApk = Join-Path $ReleaseDir "TeleCloud-1.1.3-arm64.apk"
 Copy-Item $ApkSource $FinalApk -Force
 Write-Host "Output APK: $FinalApk ($((Get-Item $FinalApk).Length / 1MB | ForEach-Object { '{0:N2} MB' -f $_ }))" -ForegroundColor Green
 

@@ -352,7 +352,7 @@ export const UserGuideModal: React.FC<UserGuideModalProps> = ({
         {/* Footer */}
         <div className="p-4 border-t border-slate-800/80 bg-vault-950/60 flex items-center justify-between shrink-0">
           <span className="text-[11px] text-slate-400 font-mono">
-            TeleCloud v1.0.0 • MTProto Protocol
+            TeleCloud v1.1.3 • MTProto Protocol
           </span>
 
           <button

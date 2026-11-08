@@ -92,6 +92,7 @@ release/*.apk
 *.payload.zip
 payload.zip
 installer/staging/
+codebase.md
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/

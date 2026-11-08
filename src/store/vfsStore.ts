@@ -49,6 +49,11 @@ interface VFSState {
   fileChunks: FileChunkRecord[];
   loadingChunks: boolean;
 
+  // File Preview
+  previewFile: FileRecord | FileItem | null;
+  openPreview: (file: FileRecord | FileItem) => void;
+  closePreview: () => void;
+
   // Transfers
   transfers: Record<string, TransferProgress>;
   activeTransfers: Record<string, ActiveTransfer>;
@@ -108,6 +113,19 @@ export const useVFSStore = create<VFSState>((set, get) => ({
   inspectingFile: null,
   fileChunks: [],
   loadingChunks: false,
+
+  previewFile: null,
+  openPreview: (file: FileRecord | FileItem) => {
+    invoke('prepare_preview', { fileId: file.id }).catch(() => {});
+    set({ previewFile: file });
+  },
+  closePreview: () => {
+    const cur = get().previewFile;
+    if (cur) {
+      invoke('cancel_preview', { fileId: cur.id }).catch(() => {});
+    }
+    set({ previewFile: null });
+  },
 
   transfers: {},
   activeTransfers: {},

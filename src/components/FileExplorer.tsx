@@ -18,6 +18,8 @@ import { DesktopTransferBar, MobileTransfersNavButton, MobileTransfersPanel } fr
 import { TelegramDriveLogo } from './TelegramDriveLogo';
 import { UserGuideModal } from './UserGuideModal';
 import { AboutModal } from './AboutModal';
+import { FileThumbnail } from './FileThumbnail';
+import { FilePreviewModal } from './FilePreviewModal';
 import {
   Folder,
   FolderPlus,
@@ -39,6 +41,7 @@ import {
   Edit2,
   Download,
   Eye,
+  Play,
   X,
   RefreshCw,
   Loader2,
@@ -46,8 +49,6 @@ import {
   CloudUpload,
   Copy,
   Check,
-  CheckSquare,
-  Square,
   Database,
   Shield,
   BookOpen,
@@ -102,6 +103,9 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
     inspectingFile,
     fileChunks,
     loadingChunks,
+    previewFile,
+    openPreview,
+    closePreview,
     setCurrentFolder,
     createFolder,
     deleteItem,
@@ -131,6 +135,9 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
       inspectingFile: state.inspectingFile,
       fileChunks: state.fileChunks,
       loadingChunks: state.loadingChunks,
+      previewFile: state.previewFile,
+      openPreview: state.openPreview,
+      closePreview: state.closePreview,
       setCurrentFolder: state.setCurrentFolder,
       createFolder: state.createFolder,
       deleteItem: state.deleteItem,
@@ -1079,33 +1086,61 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                                     toggleSelection(file.id);
                                   }
                                 }}
-                                onDoubleClick={() => handleDownloadFile(file)}
-                                className={`relative min-w-0 overflow-hidden p-3 sm:p-4 rounded-xl border card-hover group flex flex-col justify-between h-36 sm:h-40 cursor-pointer select-none ${
+                                onDoubleClick={() => openPreview(file)}
+                                className={`relative min-w-0 overflow-hidden p-2.5 sm:p-3 rounded-xl border card-hover group flex flex-col justify-between cursor-pointer select-none ${
                                   isSelected
                                     ? 'bg-cyan-950/30 border-cyan-500/50 shadow-md shadow-cyan-500/10'
                                     : 'bg-slate-900/40 hover:bg-slate-800/50 border-slate-800/80 hover:border-slate-700'
                                 }`}
                               >
-                                <div className="flex items-start justify-between">
-                                  <div className="h-9 w-9 sm:h-10 sm:w-10 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400 shrink-0">
-                                    <FileIcon mimeType={file.mime_type} name={file.name} className="h-5 w-5" />
+                                {/* Top Header / Status Row */}
+                                <div className="flex items-center justify-between mb-1.5 min-h-[24px]">
+                                  {/* Selection Checkbox (Clean, only appears on hover, when selected, or in multi-select mode) */}
+                                  <div
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleSelection(file.id);
+                                    }}
+                                    className={`transition-all duration-200 p-0.5 rounded cursor-pointer ${
+                                      isSelected
+                                        ? 'opacity-100 scale-100'
+                                        : selectedIds.length > 0
+                                          ? 'opacity-70 hover:opacity-100 hover:scale-105'
+                                          : 'opacity-0 group-hover:opacity-100 hover:scale-105'
+                                    }`}
+                                    title={isSelected ? 'Deselect item' : 'Select item'}
+                                  >
+                                    {isSelected ? (
+                                      <div className="w-4 h-4 rounded bg-cyan-500 text-slate-950 flex items-center justify-center shadow-md shadow-cyan-500/25">
+                                        <Check className="w-3 h-3 stroke-[3]" />
+                                      </div>
+                                    ) : (
+                                      <div className="w-4 h-4 rounded border border-slate-500/60 bg-slate-900/80 hover:border-cyan-400 hover:bg-slate-800 transition-colors" />
+                                    )}
                                   </div>
 
-                                  <div className="relative flex items-center justify-end min-h-[28px]">
-                                    {/* Normal Status Badge: smoothly hides on desktop hover to reveal action capsule */}
+                                  <div className="relative flex items-center justify-end">
+                                    {/* Normal Status Badge */}
                                     <div className={`flex items-center transition-opacity duration-150 ${!isMobile && !isAndroid() ? 'group-hover:opacity-0 group-hover:pointer-events-none' : ''}`}>
                                       <FileStatusBadge status={file.status} />
                                     </div>
 
-                                    {/* Desktop Hover Action Capsule: appears neatly in place of status badge */}
+                                    {/* Desktop Hover Action Capsule */}
                                     {!isMobile && !isAndroid() && (
                                       <div
-                                        className="absolute right-0 top-0 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto flex items-center gap-1 transition-all duration-150 bg-slate-900/95 backdrop-blur-sm px-1.5 py-0.5 rounded-lg border border-slate-700/60 shadow-sm"
+                                        className="absolute right-0 top-0 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto flex items-center gap-1 transition-all duration-150 bg-slate-900/95 backdrop-blur-sm px-1.5 py-0.5 rounded-lg border border-slate-700/60 shadow-sm z-20"
                                         onClick={(e) => e.stopPropagation()}
                                       >
                                         <button
-                                          onClick={() => handleDownloadFile(file)}
+                                          onClick={() => openPreview(file)}
                                           className="p-1 rounded hover:bg-slate-700 text-cyan-400 hover:text-cyan-300 transition-colors"
+                                          title="Preview File"
+                                        >
+                                          <Play className="w-3.5 h-3.5 fill-current" />
+                                        </button>
+                                        <button
+                                          onClick={() => handleDownloadFile(file)}
+                                          className="p-1 rounded hover:bg-slate-700 text-slate-300 hover:text-white transition-colors"
                                           title="Download File"
                                         >
                                           <Download className="w-3.5 h-3.5" />
@@ -1152,12 +1187,17 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                                           e.stopPropagation();
                                           setActionSheetItem({ type: 'file', item: file });
                                         }}
-                                        className="p-1.5 -mr-1 text-slate-400 active:text-white hover:text-white rounded-lg active:bg-slate-800/60 transition"
+                                        className="p-1 -mr-1 text-slate-400 active:text-white hover:text-white rounded-lg active:bg-slate-800/60 transition"
                                       >
                                         <MoreVertical className="w-4 h-4" />
                                       </button>
                                     )}
                                   </div>
+                                </div>
+
+                                {/* Thumbnail Area */}
+                                <div className="w-full mb-2">
+                                  <FileThumbnail file={file} view="grid" />
                                 </div>
 
                                 <div>
@@ -1203,19 +1243,37 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                                       draggable
                                       onDragStart={() => handleDragStart(file.id, false)}
                                       onClick={() => toggleSelection(file.id)}
+                                      onDoubleClick={() => openPreview(file)}
                                       className={`hover:bg-slate-800/30 transition-colors cursor-pointer select-none ${
                                         isSelected ? 'bg-cyan-950/20' : ''
                                       }`}
                                     >
-                                      <td className="p-3.5">
-                                        {isSelected ? (
-                                          <CheckSquare className="w-4 h-4 text-cyan-400" />
-                                        ) : (
-                                          <Square className="w-4 h-4 text-slate-600" />
-                                        )}
+                                      <td className="p-3.5 w-10">
+                                        <div
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            toggleSelection(file.id);
+                                          }}
+                                          className={`transition-all duration-200 p-0.5 rounded cursor-pointer ${
+                                            isSelected
+                                              ? 'opacity-100'
+                                              : selectedIds.length > 0
+                                                ? 'opacity-70 hover:opacity-100'
+                                                : 'opacity-20 group-hover:opacity-100'
+                                          }`}
+                                          title={isSelected ? 'Deselect item' : 'Select item'}
+                                        >
+                                          {isSelected ? (
+                                            <div className="w-4 h-4 rounded bg-cyan-500 text-slate-950 flex items-center justify-center shadow-sm shadow-cyan-500/25">
+                                              <Check className="w-3 h-3 stroke-[3]" />
+                                            </div>
+                                          ) : (
+                                            <div className="w-4 h-4 rounded border border-slate-600/60 bg-slate-900/60 hover:border-cyan-400 transition-colors" />
+                                          )}
+                                        </div>
                                       </td>
                                       <td className="p-3.5 flex items-center gap-2.5 font-medium text-slate-200">
-                                        <FileIcon mimeType={file.mime_type} name={file.name} className="h-4 w-4 shrink-0 text-blue-400" />
+                                        <FileThumbnail file={file} view="list" />
                                         <span className="truncate max-w-xs">{file.name}</span>
                                       </td>
                                       <td className="p-3.5 text-xs font-mono text-slate-400">
@@ -1232,6 +1290,13 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                                           className="flex items-center justify-end gap-1.5"
                                           onClick={(e) => e.stopPropagation()}
                                         >
+                                          <button
+                                            onClick={() => openPreview(file)}
+                                            className="p-1 hover:text-cyan-300 text-cyan-400 transition-colors"
+                                            title="Preview File"
+                                          >
+                                            <Play className="h-4 w-4 fill-current" />
+                                          </button>
                                           <button
                                             onClick={() => handleDownloadFile(file)}
                                             className="p-1 hover:text-cyan-400 text-slate-500 transition-colors"
@@ -1289,9 +1354,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                                 className="p-3 flex items-center justify-between gap-3 active:bg-slate-800/40 select-none cursor-pointer"
                               >
                                 <div className="flex items-center gap-3 min-w-0 flex-1">
-                                  <div className="w-9 h-9 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400 shrink-0">
-                                    <FileIcon mimeType={file.mime_type} name={file.name} className="w-4 h-4" />
-                                  </div>
+                                  <FileThumbnail file={file} view="list" className="w-9 h-9 shrink-0" />
                                   <div className="min-w-0 flex-1">
                                     <p className="text-xs font-medium text-slate-200 truncate">{file.name}</p>
                                     <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono mt-0.5">
@@ -1558,7 +1621,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         {/* ============================================================== */}
         {/* MOBILE BOTTOM NAVIGATION BAR (Google Drive / Telegram Style)   */}
         {/* ============================================================== */}
-        <nav className={`${isMobile ? 'flex' : 'hidden'} h-16 border-t border-slate-800/90 bg-[#070b14]/95 backdrop-blur-xl flex items-center justify-around px-2 pb-safe shrink-0 z-40 select-none`}>
+        <nav className={`${isMobile ? 'flex' : 'hidden'} h-16 border-t border-slate-800/90 bg-[#070b14]/95 backdrop-blur-xl flex items-center justify-around px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] shrink-0 z-40 select-none`}>
           <button
             onClick={() => setMobileTab('files')}
             className={`flex-1 flex flex-col items-center justify-center py-1 transition-all ${
@@ -1603,8 +1666,9 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
 
       {/* ============================================================== */}
       {/* CYBERPUNK FLOATING ACTION BUTTON (FAB) FOR MOBILE             */}
+      {/* Only visible on 'files' tab and positioned safely above nav    */}
       {/* ============================================================== */}
-      <div className={`${isMobile ? 'flex' : 'hidden'} fixed bottom-20 right-4 z-40 flex-col items-end gap-2.5`}>
+      <div className={`${isMobile && mobileTab === 'files' ? 'flex' : 'hidden'} fixed bottom-24 right-5 z-40 flex-col items-end gap-2.5`}>
         {isFabOpen && (
           <div className="flex flex-col items-end gap-2.5 animate-slideUp">
             <button
@@ -1635,7 +1699,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         )}
         <button
           onClick={() => setIsFabOpen(!isFabOpen)}
-          className={`w-14 h-14 rounded-full bg-gradient-to-tr from-cyan-500 to-blue-600 text-white flex items-center justify-center shadow-[0_0_20px_rgba(6,182,212,0.45)] transition-transform duration-200 active:scale-95 ${
+          className={`w-13 h-13 sm:w-14 sm:h-14 rounded-full bg-gradient-to-tr from-cyan-500 to-blue-600 text-white flex items-center justify-center shadow-[0_4px_24px_rgba(6,182,212,0.45)] transition-all duration-200 active:scale-95 ${
             isFabOpen ? 'rotate-45' : ''
           }`}
           title="New Action"
@@ -1686,6 +1750,18 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
             <div className="space-y-1">
               {actionSheetItem.type === 'file' && (
                 <>
+                  <button
+                    onClick={() => {
+                      const file = actionSheetItem.item as FileItem;
+                      setActionSheetItem(null);
+                      openPreview(file);
+                    }}
+                    className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 font-bold text-sm border border-cyan-500/20 transition"
+                  >
+                    <Play className="w-4 h-4 fill-current" />
+                    <span>Preview File</span>
+                  </button>
+
                   <button
                     onClick={() => {
                       const file = actionSheetItem.item as FileItem;
@@ -1807,6 +1883,16 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {/* File Preview Modal */}
+      {previewFile && (
+        <FilePreviewModal
+          file={previewFile}
+          onClose={closePreview}
+          onDownload={(f) => handleDownloadFile(f)}
+          onInspectChunks={(f) => inspectFileChunks(f as unknown as FileRecord)}
+        />
       )}
 
       {/* Chunk Inspector Modal */}

@@ -6,6 +6,7 @@ use crate::db::cloud_sync::{CloudSyncManager, SyncStatus};
 use crate::db::schema::{BreadcrumbItem, DbManager, FileChunkRecord, FileRecord, FolderRecord};
 use crate::engine::chunk_merger::ChunkMergerManager;
 use crate::engine::chunk_uploader::ChunkUploaderManager;
+use crate::engine::preview_stream::PreviewStreamManager;
 use crate::error::AppError;
 use crate::telegram::bot_pool::{BotPool, BotPoolHealth, WorkerBotInfo};
 use crate::telegram::client::{
@@ -330,6 +331,7 @@ pub fn delete_file(
     permanent: Option<bool>,
     db: State<'_, Arc<DbManager>>,
     cloud_sync: State<'_, Arc<CloudSyncManager>>,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
     if permanent.unwrap_or(false) {
@@ -337,6 +339,11 @@ pub fn delete_file(
     } else {
         db.set_file_trashed(&id, true)?;
     }
+    let mgr = Arc::clone(&*stream_mgr);
+    let f_id = id.clone();
+    tokio::spawn(async move {
+        mgr.delete_file_cache(&f_id).await;
+    });
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
     Ok(())
 }
@@ -428,6 +435,7 @@ pub async fn start_upload(
     file_path: String,
     folder_id: Option<String>,
     uploader: State<'_, Arc<ChunkUploaderManager>>,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
 ) -> Result<FileRecord, AppError> {
     let resolved_path = if file_path.starts_with("content://") {
         crate::android_bridge::resolve_content_uri(&file_path)
@@ -439,7 +447,10 @@ pub async fn start_upload(
     } else {
         file_path
     };
-    uploader.start_upload(app_handle, &resolved_path, folder_id).await
+    let file_rec = uploader.start_upload(app_handle, &resolved_path, folder_id).await?;
+    let path_ref = std::path::Path::new(&resolved_path);
+    stream_mgr.cache_local_upload_head_tail(&file_rec.id, path_ref, file_rec.total_size_bytes).await;
+    Ok(file_rec)
 }
 
 #[tauri::command]
@@ -617,6 +628,119 @@ pub fn get_default_download_directory(app_handle: tauri::AppHandle) -> Result<St
 pub fn request_android_permissions() -> Result<(), AppError> {
     crate::android_bridge::request_app_permissions();
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_preview_stream_url(
+    file_id: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<String, AppError> {
+    Ok(stream_mgr.get_stream_url(&file_id))
+}
+
+#[tauri::command]
+pub fn get_preview_thumbnail_url(
+    file_id: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<String, AppError> {
+    Ok(stream_mgr.get_thumbnail_url(&file_id))
+}
+
+#[tauri::command]
+pub async fn get_file_thumbnail(
+    file_id: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<Option<String>, AppError> {
+    stream_mgr.get_thumbnail_base64(&file_id).await
+}
+
+#[tauri::command]
+pub async fn save_file_thumbnail(
+    file_id: String,
+    base64_data: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<(), AppError> {
+    stream_mgr.save_thumbnail(&file_id, &base64_data).await
+}
+
+#[tauri::command]
+pub async fn get_file_preview_text(
+    file_id: String,
+    max_bytes: Option<usize>,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<String, AppError> {
+    stream_mgr.get_preview_text(&file_id, max_bytes).await
+}
+
+#[tauri::command]
+pub async fn probe_media(
+    file_id: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<crate::engine::media_probe::MediaProbe, AppError> {
+    stream_mgr.probe_media(&file_id).await
+}
+
+#[tauri::command]
+pub async fn prepare_preview(
+    file_id: String,
+    app_handle: AppHandle,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<(), AppError> {
+    let mgr = Arc::clone(&*stream_mgr);
+    tokio::spawn(async move {
+        if let Err(e) = mgr.prepare_preview(&file_id, &app_handle).await {
+            eprintln!("[PreviewStream] prepare_preview error for {file_id}: {e}");
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_preview(
+    file_id: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<(), AppError> {
+    stream_mgr.cancel_preview(&file_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_preview_cache(
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+) -> Result<(), AppError> {
+    stream_mgr.clear_preview_cache().await
+}
+
+#[tauri::command]
+pub fn open_native_player(
+    file_id: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+    db: State<'_, Arc<DbManager>>,
+) -> Result<bool, AppError> {
+    let url = stream_mgr.get_stream_url(&file_id);
+    let title = db
+        .get_file(&file_id)?
+        .map(|f| f.name)
+        .unwrap_or_else(|| "Video".into());
+    crate::android_bridge::open_native_player(&url, &title);
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn open_external_player(
+    file_id: String,
+    stream_mgr: State<'_, Arc<PreviewStreamManager>>,
+    db: State<'_, Arc<DbManager>>,
+) -> Result<bool, AppError> {
+    let url = stream_mgr.get_stream_url(&file_id);
+    let file = db.get_file(&file_id)?;
+    let title = file.as_ref().map(|f| f.name.as_str()).unwrap_or("Video");
+    let mime = file
+        .as_ref()
+        .map(|f| f.mime_type.as_str())
+        .unwrap_or("video/*");
+    crate::android_bridge::open_in_external_player(&url, mime, title);
+    Ok(true)
 }
 
 

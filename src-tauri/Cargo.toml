@@ -1,6 +1,6 @@
 [package]
 name = "telecloud-vault"
-version = "1.0.0"
+version = "1.1.3"
 description = "TeleCloud — Unlimited Cloud Storage backed by Telegram MTProto"
 authors = ["J Daniel Wonderson"]
 edition = "2021"
@@ -37,6 +37,7 @@ rand = "0.8"
 aes-gcm = "0.10"
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

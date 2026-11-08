@@ -265,6 +265,48 @@ pub mod bridge {
             }
         }
     }
+
+    pub fn open_native_player(url: &str, title: &str) {
+        if let Some(vm) = get_jvm() {
+            if let Ok(mut env) = vm.attach_current_thread() {
+                if let Some(class) = get_main_activity_class(&mut env) {
+                    if let (Ok(j_url), Ok(j_title)) = (env.new_string(url), env.new_string(title)) {
+                        let _ = env.call_static_method(
+                            class,
+                            "openNativePlayer",
+                            "(Ljava/lang/String;Ljava/lang/String;)V",
+                            &[jni::objects::JValue::from(&j_url), jni::objects::JValue::from(&j_title)],
+                        );
+                        if env.exception_check().unwrap_or(false) {
+                            let _ = env.exception_describe();
+                            let _ = env.exception_clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn open_in_external_player(url: &str, mime: &str, title: &str) {
+        if let Some(vm) = get_jvm() {
+            if let Ok(mut env) = vm.attach_current_thread() {
+                if let Some(class) = get_main_activity_class(&mut env) {
+                    if let (Ok(j_url), Ok(j_mime), Ok(j_title)) = (env.new_string(url), env.new_string(mime), env.new_string(title)) {
+                        let _ = env.call_static_method(
+                            class,
+                            "openInExternalPlayer",
+                            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                            &[jni::objects::JValue::from(&j_url), jni::objects::JValue::from(&j_mime), jni::objects::JValue::from(&j_title)],
+                        );
+                        if env.exception_check().unwrap_or(false) {
+                            let _ = env.exception_describe();
+                            let _ = env.exception_clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -295,6 +337,10 @@ pub mod bridge {
     pub fn cancel_notification(_notification_id: i32) {}
 
     pub fn request_app_permissions() {}
+
+    pub fn open_native_player(_url: &str, _title: &str) {}
+
+    pub fn open_in_external_player(_url: &str, _mime: &str, _title: &str) {}
 }
 
 pub fn get_notif_id(file_id: &str) -> i32 {

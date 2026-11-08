@@ -33,7 +33,7 @@ export const AboutModal: React.FC<AboutModalProps> = ({ isOpen, onClose }) => {
           <div className="flex items-center gap-3">
             <span className="px-2.5 py-1 rounded-full text-[11px] font-mono font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              v1.0.0 Stable
+              v1.1.3 Stable
             </span>
             <button
               onClick={onClose}
@@ -53,7 +53,7 @@ export const AboutModal: React.FC<AboutModalProps> = ({ isOpen, onClose }) => {
               Made by <span className="text-slate-100 font-medium">J Daniel Wonderson</span> (Creator & Architect)
             </span>
             <span className="text-[10px] font-mono text-slate-500">
-              TeleCloud v1.0.0
+              TeleCloud v1.1.3
             </span>
           </div>
 
