@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { useVFSStore } from '../store/vfsStore';
@@ -48,6 +48,9 @@ import {
   Sliders,
   CloudUpload,
   Copy,
+  Scissors,
+  Clipboard,
+  CornerLeftUp,
   Check,
   Database,
   Shield,
@@ -69,6 +72,7 @@ interface FileExplorerProps {
   onOpenFeedback?: () => void;
   onWipeVault?: () => void;
   onRefreshStatus?: () => void;
+  onCheckUpdates?: () => void;
 }
 
 const FOLDER_COLORS = [
@@ -87,6 +91,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   onOpenFeedback,
   onWipeVault,
   onRefreshStatus,
+  onCheckUpdates,
 }) => {
   const isMobile = useMobile(768);
 
@@ -121,6 +126,13 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
     startFileDownload,
     loadDirectory,
     setDrawerOpen,
+    clipboard,
+    copySelectionToClipboard,
+    cutSelectionToClipboard,
+    copyItemToClipboard,
+    cutItemToClipboard,
+    clearClipboard,
+    pasteClipboard,
   } = useVFSStore(
     useShallow((state) => ({
       currentFolderId: state.currentFolderId,
@@ -153,6 +165,14 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
       startFileDownload: state.startFileDownload,
       loadDirectory: state.loadDirectory,
       setDrawerOpen: state.setDrawerOpen,
+      clipboard: state.clipboard,
+      copySelectionToClipboard: state.copySelectionToClipboard,
+      cutSelectionToClipboard: state.cutSelectionToClipboard,
+      copyItemToClipboard: state.copyItemToClipboard,
+      cutItemToClipboard: state.cutItemToClipboard,
+      clearClipboard: state.clearClipboard,
+      pasteClipboard: state.pasteClipboard,
+      copyItem: state.copyItem,
     }))
   );
 
@@ -188,6 +208,23 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   const [draggedItem, setDraggedItem] = useState<{ id: string; isFolder: boolean } | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   const [isOsDraggingOver, setIsOsDraggingOver] = useState(false);
+  const [isPasting, setIsPasting] = useState(false);
+  const [clipboardToast, setClipboardToast] = useState<string | null>(null);
+  const springTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearSpringTimer = () => {
+    if (springTimerRef.current) {
+      clearTimeout(springTimerRef.current);
+      springTimerRef.current = null;
+    }
+  };
+
+  const scheduleSpringNavigation = (folderId: string | null) => {
+    clearSpringTimer();
+    springTimerRef.current = setTimeout(() => {
+      setCurrentFolder(folderId);
+    }, 650);
+  };
 
   // Rename modal state
   const [renameItem, setRenameItem] = useState<{
@@ -401,24 +438,88 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
     }
   };
 
-  // Drag and Drop handlers (desktop)
+  // Drag and Drop handlers (desktop & nested forward/backward navigation)
   const handleDragStart = (id: string, isFolder: boolean) => {
     setDraggedItem({ id, isFolder });
   };
 
   const handleDropOnFolder = async (targetFolderId: string | null) => {
+    clearSpringTimer();
     setDragOverFolderId(null);
     if (!draggedItem) return;
     if (draggedItem.id === targetFolderId) return;
+    if (targetFolderId === currentFolderId) return;
 
     try {
-      await moveItem(draggedItem.id, draggedItem.isFolder, targetFolderId);
+      const itemsToMove = selectedIds.includes(draggedItem.id)
+        ? selectedIds.map((id) => {
+            const isF = folders.some((f) => f.id === id);
+            return { id, isFolder: isF };
+          })
+        : [draggedItem];
+
+      for (const item of itemsToMove) {
+        if (item.id !== targetFolderId) {
+          await moveItem(item.id, item.isFolder, targetFolderId);
+        }
+      }
+      clearSelection();
     } catch (err) {
       console.error('Failed to move item:', err);
     } finally {
       setDraggedItem(null);
     }
   };
+
+  const handlePaste = async (targetFolderId?: string | null) => {
+    if (!clipboard || clipboard.items.length === 0) return;
+    setIsPasting(true);
+    try {
+      await pasteClipboard(targetFolderId !== undefined ? targetFolderId : currentFolderId);
+      setClipboardToast(`Pasted ${clipboard.items.length} item(s)`);
+      setTimeout(() => setClipboardToast(null), 2500);
+    } catch (err) {
+      console.error('Paste error:', err);
+    } finally {
+      setIsPasting(false);
+    }
+  };
+
+  // Keyboard Shortcuts: Ctrl+C (Copy), Ctrl+X (Cut), Ctrl+V (Paste)
+  useEffect(() => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return;
+      }
+
+      const isCtrlOrCmd = e.ctrlKey || e.metaKey;
+
+      if (isCtrlOrCmd && e.key.toLowerCase() === 'c') {
+        if (selectedIds.length > 0) {
+          e.preventDefault();
+          copySelectionToClipboard();
+          setClipboardToast(`Copied ${selectedIds.length} item(s) to clipboard`);
+          setTimeout(() => setClipboardToast(null), 2500);
+        }
+      } else if (isCtrlOrCmd && e.key.toLowerCase() === 'x') {
+        if (selectedIds.length > 0) {
+          e.preventDefault();
+          cutSelectionToClipboard();
+          setClipboardToast(`Cut ${selectedIds.length} item(s) to clipboard`);
+          setTimeout(() => setClipboardToast(null), 2500);
+        }
+      } else if (isCtrlOrCmd && e.key.toLowerCase() === 'v') {
+        if (clipboard && clipboard.items.length > 0) {
+          e.preventDefault();
+          handlePaste(currentFolderId);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedIds, clipboard, currentFolderId, copySelectionToClipboard, cutSelectionToClipboard, pasteClipboard]);
 
   // Batch deletion
   const handleBatchDelete = async () => {
@@ -926,7 +1027,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
 
               {/* Batch Selection Action Bar */}
               {selectedIds.length > 0 && (
-                <div className="p-3 rounded-xl bg-slate-900/90 border border-cyan-500/30 flex items-center justify-between text-xs backdrop-blur-md shadow-lg sticky top-2 z-20">
+                <div className="p-3 rounded-xl bg-slate-900/90 border border-cyan-500/30 flex flex-wrap items-center justify-between gap-2 text-xs backdrop-blur-md shadow-lg sticky top-2 z-20 animate-slideUp">
                   <div className="flex items-center gap-3">
                     <span className="font-semibold text-cyan-300">
                       {selectedIds.length} item(s) selected
@@ -939,13 +1040,90 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                     </button>
                   </div>
 
-                  <button
-                    onClick={handleBatchDelete}
-                    className="px-3 py-1 rounded-lg bg-red-950/40 hover:bg-red-900/60 text-red-400 border border-red-500/30 font-medium transition flex items-center gap-1.5"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Delete</span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        copySelectionToClipboard();
+                        setClipboardToast(`Copied ${selectedIds.length} item(s) to clipboard`);
+                        setTimeout(() => setClipboardToast(null), 2500);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium transition flex items-center gap-1.5 active:scale-95"
+                      title="Copy selected items (Ctrl+C)"
+                    >
+                      <Copy className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Copy</span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        cutSelectionToClipboard();
+                        setClipboardToast(`Cut ${selectedIds.length} item(s) to clipboard`);
+                        setTimeout(() => setClipboardToast(null), 2500);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium transition flex items-center gap-1.5 active:scale-95"
+                      title="Cut selected items (Ctrl+X)"
+                    >
+                      <Scissors className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Cut</span>
+                    </button>
+
+                    <button
+                      onClick={handleBatchDelete}
+                      className="px-3 py-1.5 rounded-lg bg-red-950/40 hover:bg-red-900/60 text-red-400 border border-red-500/30 font-medium transition flex items-center gap-1.5 active:scale-95"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Delete</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Clipboard Active Action Banner */}
+              {clipboard && clipboard.items.length > 0 && (
+                <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/40 flex flex-wrap items-center justify-between gap-2 text-xs backdrop-blur-md shadow-lg sticky top-2 z-20 animate-fadeIn">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-6 h-6 rounded-lg bg-amber-500/20 flex items-center justify-center text-amber-400 shrink-0">
+                      {clipboard.operation === 'cut' ? (
+                        <Scissors className="w-3.5 h-3.5" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                    </div>
+                    <span className="text-amber-200">
+                      <strong>{clipboard.items.length} item(s)</strong> {clipboard.operation === 'cut' ? 'cut' : 'copied'} to clipboard
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => handlePaste(currentFolderId)}
+                      disabled={isPasting}
+                      className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold transition flex items-center gap-1.5 active:scale-95 shadow-md shadow-amber-500/20 disabled:opacity-50"
+                    >
+                      {isPasting ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Clipboard className="w-3.5 h-3.5" />
+                      )}
+                      <span>Paste Here</span>
+                    </button>
+
+                    <button
+                      onClick={clearClipboard}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                      title="Clear clipboard"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Toast Notification */}
+              {clipboardToast && (
+                <div className="fixed bottom-6 right-6 z-50 px-4 py-2.5 rounded-2xl bg-slate-900/95 border border-cyan-500/40 text-cyan-300 text-xs font-semibold shadow-2xl backdrop-blur-xl animate-fadeIn flex items-center gap-2 pointer-events-none">
+                  <Check className="w-4 h-4 text-cyan-400" />
+                  <span>{clipboardToast}</span>
                 </div>
               )}
 
@@ -967,6 +1145,45 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                 />
               ) : (
                 <div className="space-y-4 sm:space-y-6">
+                  {/* Backward Parent Folder Navigation & Drop Target */}
+                  {previousCrumb && (
+                    <div
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        setDragOverFolderId('parent-folder');
+                        scheduleSpringNavigation(previousCrumb.id);
+                      }}
+                      onDragLeave={() => {
+                        clearSpringTimer();
+                        setDragOverFolderId(null);
+                      }}
+                      onDrop={() => handleDropOnFolder(previousCrumb.id)}
+                      onClick={() => setCurrentFolder(previousCrumb.id)}
+                      className={`p-3 rounded-xl border flex items-center justify-between cursor-pointer select-none transition-all duration-150 ${
+                        dragOverFolderId === 'parent-folder'
+                          ? 'ring-2 ring-cyan-400 bg-cyan-950/60 border-cyan-400 scale-[1.01]'
+                          : 'bg-slate-900/40 hover:bg-slate-800/60 border-slate-800/80 text-slate-300 hover:border-cyan-500/30'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 truncate">
+                        <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400 shrink-0">
+                          <CornerLeftUp className="w-4 h-4" />
+                        </div>
+                        <div className="flex flex-col truncate">
+                          <span className="text-xs sm:text-sm font-semibold text-slate-200 truncate">
+                            .. Back to {previousCrumb.name}
+                          </span>
+                          <span className="text-[10px] text-slate-500 font-mono">
+                            Navigate backward or drop items here to move up
+                          </span>
+                        </div>
+                      </div>
+                      <span className="text-[11px] font-mono text-cyan-400/90 shrink-0 px-2.5 py-1 rounded-md bg-slate-800/60 border border-slate-700/60">
+                        {dragOverFolderId === 'parent-folder' ? 'Drop backward here' : 'Parent Folder'}
+                      </span>
+                    </div>
+                  )}
+
                   {/* Sub-Folders Section */}
                   {filteredFolders.length > 0 && (
                     <div>
@@ -986,8 +1203,12 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                               onDragOver={(e) => {
                                 e.preventDefault();
                                 setDragOverFolderId(f.id);
+                                scheduleSpringNavigation(f.id);
                               }}
-                              onDragLeave={() => setDragOverFolderId(null)}
+                              onDragLeave={() => {
+                                clearSpringTimer();
+                                setDragOverFolderId(null);
+                              }}
                               onDrop={() => handleDropOnFolder(f.id)}
                               onClick={() => {
                                 // Touch-friendly: single-tap opens folder immediately on mobile
@@ -1012,6 +1233,30 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                               {/* Desktop Hover Actions */}
                               {!isMobile && !isAndroid() && (
                                 <div className="hidden md:flex opacity-0 group-hover:opacity-100 items-center gap-1 transition-opacity">
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      copyItemToClipboard(f.id, true, f.name);
+                                      setClipboardToast(`Copied folder "${f.name}"`);
+                                      setTimeout(() => setClipboardToast(null), 2500);
+                                    }}
+                                    className="p-1 hover:text-cyan-400 text-slate-500 transition"
+                                    title="Copy Folder"
+                                  >
+                                    <Copy className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      cutItemToClipboard(f.id, true, f.name);
+                                      setClipboardToast(`Cut folder "${f.name}"`);
+                                      setTimeout(() => setClipboardToast(null), 2500);
+                                    }}
+                                    className="p-1 hover:text-amber-400 text-slate-500 transition"
+                                    title="Cut Folder"
+                                  >
+                                    <Scissors className="h-3.5 w-3.5" />
+                                  </button>
                                   <button
                                     onClick={(e) => {
                                       e.stopPropagation();
@@ -1151,6 +1396,28 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                                           title="Inspect MTProto Chunks"
                                         >
                                           <Eye className="w-3.5 h-3.5" />
+                                        </button>
+                                        <button
+                                          onClick={() => {
+                                            copyItemToClipboard(file.id, false, file.name);
+                                            setClipboardToast(`Copied "${file.name}"`);
+                                            setTimeout(() => setClipboardToast(null), 2500);
+                                          }}
+                                          className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-cyan-400 transition-colors"
+                                          title="Copy File (Ctrl+C)"
+                                        >
+                                          <Copy className="w-3.5 h-3.5" />
+                                        </button>
+                                        <button
+                                          onClick={() => {
+                                            cutItemToClipboard(file.id, false, file.name);
+                                            setClipboardToast(`Cut "${file.name}"`);
+                                            setTimeout(() => setClipboardToast(null), 2500);
+                                          }}
+                                          className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-amber-400 transition-colors"
+                                          title="Cut File (Ctrl+X)"
+                                        >
+                                          <Scissors className="w-3.5 h-3.5" />
                                         </button>
                                         <button
                                           onClick={() => {
@@ -1310,6 +1577,28 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                                             title="Inspect Chunks"
                                           >
                                             <Eye className="h-4 w-4" />
+                                          </button>
+                                          <button
+                                            onClick={() => {
+                                              copyItemToClipboard(file.id, false, file.name);
+                                              setClipboardToast(`Copied "${file.name}"`);
+                                              setTimeout(() => setClipboardToast(null), 2500);
+                                            }}
+                                            className="p-1 hover:text-cyan-400 text-slate-500 transition-colors"
+                                            title="Copy File"
+                                          >
+                                            <Copy className="h-4 w-4" />
+                                          </button>
+                                          <button
+                                            onClick={() => {
+                                              cutItemToClipboard(file.id, false, file.name);
+                                              setClipboardToast(`Cut "${file.name}"`);
+                                              setTimeout(() => setClipboardToast(null), 2500);
+                                            }}
+                                            className="p-1 hover:text-amber-400 text-slate-500 transition-colors"
+                                            title="Cut File"
+                                          >
+                                            <Scissors className="h-4 w-4" />
                                           </button>
                                           <button
                                             onClick={() => {
@@ -1671,6 +1960,19 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
       <div className={`${isMobile && mobileTab === 'files' ? 'flex' : 'hidden'} fixed bottom-24 right-5 z-40 flex-col items-end gap-2.5`}>
         {isFabOpen && (
           <div className="flex flex-col items-end gap-2.5 animate-slideUp">
+            {clipboard && clipboard.items.length > 0 && (
+              <button
+                onClick={() => {
+                  setIsFabOpen(false);
+                  handlePaste(currentFolderId);
+                }}
+                className="flex items-center gap-2 px-4 py-2.5 rounded-full bg-amber-500 text-slate-950 text-xs font-bold shadow-xl shadow-amber-500/30 transition active:scale-95"
+              >
+                <Clipboard className="w-4 h-4" />
+                <span>Paste ({clipboard.items.length} items)</span>
+              </button>
+            )}
+
             <button
               onClick={() => {
                 setIsFabOpen(false);
@@ -1787,6 +2089,36 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                   </button>
                 </>
               )}
+
+              <button
+                onClick={() => {
+                  const item = actionSheetItem.item;
+                  const isFolder = actionSheetItem.type === 'folder';
+                  setActionSheetItem(null);
+                  copyItemToClipboard(item.id, isFolder, item.name);
+                  setClipboardToast(`Copied ${isFolder ? 'folder' : 'file'} "${item.name}"`);
+                  setTimeout(() => setClipboardToast(null), 2500);
+                }}
+                className="w-full flex items-center gap-3 px-4 py-3 rounded-xl hover:bg-slate-800 text-slate-200 font-medium text-sm transition"
+              >
+                <Copy className="w-4 h-4 text-cyan-400" />
+                <span>Copy {actionSheetItem.type === 'folder' ? 'Folder' : 'File'}</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  const item = actionSheetItem.item;
+                  const isFolder = actionSheetItem.type === 'folder';
+                  setActionSheetItem(null);
+                  cutItemToClipboard(item.id, isFolder, item.name);
+                  setClipboardToast(`Cut ${isFolder ? 'folder' : 'file'} "${item.name}"`);
+                  setTimeout(() => setClipboardToast(null), 2500);
+                }}
+                className="w-full flex items-center gap-3 px-4 py-3 rounded-xl hover:bg-slate-800 text-slate-200 font-medium text-sm transition"
+              >
+                <Scissors className="w-4 h-4 text-amber-400" />
+                <span>Cut {actionSheetItem.type === 'folder' ? 'Folder' : 'File'}</span>
+              </button>
 
               <button
                 onClick={() => {
@@ -1916,6 +2248,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
       <AboutModal
         isOpen={isAboutOpen}
         onClose={() => setIsAboutOpen(false)}
+        onCheckUpdates={onCheckUpdates}
       />
     </div>
   );

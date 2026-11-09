@@ -8,7 +8,7 @@ import { isAndroid } from '../hooks/useMobile';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import mammoth from 'mammoth';
-import { cacheThumbnail } from '../utils/thumbnailQueue';
+import { cacheThumbnail, pauseThumbnailQueue, resumeThumbnailQueue } from '../utils/thumbnailQueue';
 import {
   X,
   Download,
@@ -53,6 +53,8 @@ export interface MediaProbe {
   moov_size?: number;
   webview_likely_playable: boolean;
   reason: string;
+  bitrate_bps?: number;
+  megapixels?: number;
 }
 
 export interface PreviewStatusEvent {
@@ -62,6 +64,8 @@ export interface PreviewStatusEvent {
   cached_bytes: number;
   total_bytes: number;
   speed_bps: number;
+  bitrate_bps?: number;
+  lookahead_secs?: number;
 }
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -98,10 +102,12 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [onClose]);
 
-  // Warm up preview stream on mount and cancel on unmount
+  // Warm up preview stream on mount, pause background thumbnail queue, and restore on unmount
   useEffect(() => {
+    pauseThumbnailQueue();
     invoke('prepare_preview', { fileId: file.id }).catch(() => {});
     return () => {
+      resumeThumbnailQueue();
       invoke('cancel_preview', { fileId: file.id }).catch(() => {});
     };
   }, [file.id]);
@@ -249,7 +255,7 @@ const ViewerSelector: React.FC<{
     case 'pdf':
       return <PdfViewer streamUrl={streamUrl} fileName={file.name} />;
     case 'image':
-      return <ImageViewer streamUrl={streamUrl} fileName={file.name} />;
+      return <ImageViewer streamUrl={streamUrl} fileName={file.name} onDownload={onDownload} />;
     case 'audio':
       return <AudioPlayer streamUrl={streamUrl} fileName={file.name} />;
     case 'text':
@@ -276,6 +282,7 @@ const VideoStreamPlayer: React.FC<{
 }> = ({ streamUrl, fileId, fileName: _fileName, fileMime, onDownload }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const thumbnailCapturedRef = useRef(false);
+  const nativeLaunchedRef = useRef(false);
   const [currentSrc, setCurrentSrc] = useState(streamUrl);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -296,55 +303,125 @@ const VideoStreamPlayer: React.FC<{
   const [retryCount, setRetryCount] = useState(0);
   const [retryNotice, setRetryNotice] = useState<string | null>(null);
   const [showStallNotice, setShowStallNotice] = useState(false);
+  const [streamStatus, setStreamStatus] = useState<PreviewStatusEvent | null>(null);
+  const streamStatusRef = useRef<PreviewStatusEvent | null>(null);
+  const lastBytesProgressRef = useRef<{ bytes: number; timestamp: number }>({ bytes: 0, timestamp: Date.now() });
   const onAndroid = isAndroid();
 
   // Listen to backend MTProto preview status events
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<PreviewStatusEvent>('preview://status', (event) => {
       if (fileId && event.payload.file_id === fileId) {
         setStatusMessage(event.payload.message);
         setStage(event.payload.stage);
+        setStreamStatus(event.payload);
+        streamStatusRef.current = event.payload;
+        if (event.payload.cached_bytes > lastBytesProgressRef.current.bytes) {
+          lastBytesProgressRef.current = {
+            bytes: event.payload.cached_bytes,
+            timestamp: Date.now(),
+          };
+        }
         if (event.payload.stage === 'ready') {
           setIsBuffering(false);
         }
       }
     }).then((fn) => {
-      unlisten = fn;
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
     });
 
     return () => {
+      disposed = true;
       unlisten?.();
     };
   }, [fileId]);
 
-  // Run media probe on mount
+  // Central helper: invoke open_native_player at most once per modal instance,
+  // pausing and clearing the <video> element so the WebView stops pulling stream bytes.
+  const launchNativePlayerOnce = (forceByUser = false) => {
+    if (!fileId) return;
+    if (nativeLaunchedRef.current && !forceByUser) return;
+    nativeLaunchedRef.current = true;
+
+    // Pause the <video> and remove its src so WebView stops pulling the stream
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+        videoRef.current.removeAttribute('src');
+        videoRef.current.load();
+      } catch (_e) {}
+    }
+
+    invoke('open_native_player', { fileId }).catch((err) => {
+      console.error('Failed to open native player:', err);
+      if (forceByUser) {
+        nativeLaunchedRef.current = false;
+      }
+    });
+  };
+
+  // Run media probe on mount (with mount guard)
   useEffect(() => {
     if (!fileId) return;
+    let isMounted = true;
     invoke<MediaProbe>('probe_media', { fileId })
       .then((p) => {
+        if (!isMounted) return;
         setProbe(p);
         // On Android, if webview cannot play this codec (HEVC/MKV/AC3), auto-route to native player
         if (onAndroid && !p.webview_likely_playable) {
-          invoke('open_native_player', { fileId }).catch(() => {});
+          launchNativePlayerOnce();
         }
       })
       .catch((err) => {
+        if (!isMounted) return;
         console.warn('[VideoPlayer] Media probe notice:', err);
       });
+
+    return () => {
+      isMounted = false;
+    };
   }, [fileId, onAndroid]);
 
-  // Stall watchdog: if buffering exceeds 10s without playback
+  // Stall watchdog: if buffering exceeds 10s without playback AND without incoming backend bytes
+  // Must NOT re-arm after a native launch
   useEffect(() => {
+    if (nativeLaunchedRef.current) return;
     if (!isPlaying && !hasError && isBuffering) {
-      const timer = setTimeout(() => {
-        setShowStallNotice(true);
-        // On Android, auto fallback to native player if stalled for 10s
-        if (onAndroid && fileId) {
-          invoke('open_native_player', { fileId }).catch(() => {});
+      let noProgressSeconds = 0;
+      const interval = setInterval(() => {
+        if (nativeLaunchedRef.current) {
+          clearInterval(interval);
+          return;
         }
-      }, 10000);
-      return () => clearTimeout(timer);
+        const now = Date.now();
+        const bytesArriving =
+          now - lastBytesProgressRef.current.timestamp < 3000 ||
+          (streamStatusRef.current?.speed_bps ?? 0) > 0;
+
+        if (bytesArriving) {
+          // Backend bytes are still arriving, reset noProgressSeconds
+          noProgressSeconds = 0;
+        } else {
+          noProgressSeconds += 1;
+        }
+
+        if (noProgressSeconds >= 10) {
+          setShowStallNotice(true);
+          // On Android, auto fallback to native player ONLY if no backend bytes arriving for 10s
+          if (onAndroid && fileId) {
+            launchNativePlayerOnce();
+          }
+          clearInterval(interval);
+        }
+      }, 1000);
+      return () => clearInterval(interval);
     }
     setShowStallNotice(false);
   }, [isPlaying, hasError, isBuffering, onAndroid, fileId]);
@@ -382,10 +459,7 @@ const VideoStreamPlayer: React.FC<{
   };
 
   const handleLaunchNativePlayer = () => {
-    if (!fileId) return;
-    invoke('open_native_player', { fileId }).catch((err) => {
-      console.error('Failed to open native player:', err);
-    });
+    launchNativePlayerOnce(true);
   };
 
   const handleLaunchExternalPlayer = () => {
@@ -396,6 +470,7 @@ const VideoStreamPlayer: React.FC<{
   };
 
   const handleManualRetry = () => {
+    nativeLaunchedRef.current = false;
     setHasError(false);
     setIsBuffering(true);
     setRetryNotice(null);
@@ -591,6 +666,18 @@ const VideoStreamPlayer: React.FC<{
               <span className="text-slate-400">WebView Likely Playable:</span>
               <span className={probe?.webview_likely_playable ? 'text-emerald-400' : 'text-rose-400'}>{probe?.webview_likely_playable ? 'Yes' : 'No'}</span>
             </div>
+            {probe?.bitrate_bps ? (
+              <div className="flex justify-between">
+                <span className="text-slate-400">Probe Bitrate:</span>
+                <span className="text-slate-200">{(probe.bitrate_bps / 1_000_000).toFixed(2)} Mbps</span>
+              </div>
+            ) : null}
+            {streamStatus?.speed_bps ? (
+              <div className="flex justify-between">
+                <span className="text-slate-400">Stream Throughput:</span>
+                <span className="text-slate-200">{(streamStatus.speed_bps / 1_000_000).toFixed(2)} Mbps {streamStatus.lookahead_secs !== undefined ? `(${streamStatus.lookahead_secs.toFixed(0)}s lookahead)` : ''}</span>
+              </div>
+            ) : null}
             {probe?.reason && (
               <div className="pt-1 text-[10px] text-slate-400 border-t border-slate-800/80">
                 <span className="font-semibold text-slate-300">Analysis: </span>
@@ -603,8 +690,44 @@ const VideoStreamPlayer: React.FC<{
     );
   }
 
+  const isSlowNetwork = Boolean(
+    streamStatus?.bitrate_bps &&
+    streamStatus.speed_bps > 0 &&
+    streamStatus.speed_bps < streamStatus.bitrate_bps
+  );
+
+  const displayBufferingText = isSlowNetwork
+    ? `Network slower than video bitrate, buffering${
+        streamStatus?.lookahead_secs !== undefined
+          ? ` (${streamStatus.lookahead_secs.toFixed(0)}s ahead)`
+          : ''
+      }...`
+    : (statusMessage || 'Buffering media stream...');
+
   return (
     <div className="relative w-full h-full flex flex-col items-center justify-center bg-black group select-none">
+      {/* Slow Network Buffering Banner */}
+      {isSlowNetwork && isBuffering && !showStallNotice && (
+        <div className="absolute top-3 inset-x-3 sm:inset-x-6 z-20 flex items-center justify-between p-2.5 sm:p-3 rounded-xl bg-amber-500/15 border border-amber-500/30 backdrop-blur-md text-amber-200 text-xs shadow-lg animate-fade-in">
+          <div className="flex items-center gap-2 min-w-0 pr-2">
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="truncate">
+              Network slower than video bitrate, buffering... (Speed: {((streamStatus?.speed_bps ?? 0) / 1_000_000).toFixed(1)} Mbps | Video: {((streamStatus?.bitrate_bps ?? 0) / 1_000_000).toFixed(1)} Mbps)
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {onAndroid && (
+              <button
+                onClick={handleLaunchNativePlayer}
+                className="px-2.5 py-1 rounded-lg bg-amber-500/30 hover:bg-amber-500/40 text-amber-200 font-semibold border border-amber-500/40 transition text-[11px]"
+              >
+                Native Player
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Top Stall Notice Banner */}
       {showStallNotice && (
         <div className="absolute top-3 inset-x-3 sm:inset-x-6 z-20 flex items-center justify-between p-2.5 sm:p-3 rounded-xl bg-amber-500/15 border border-amber-500/30 backdrop-blur-md text-amber-200 text-xs shadow-lg animate-fade-in">
@@ -710,9 +833,9 @@ const VideoStreamPlayer: React.FC<{
             }
           }
 
-          // If decode error on Android, auto fallback to native player
+          // If decode error on Android, auto fallback to native player (at most once)
           if (onAndroid && (code === 3 || code === 4 || !probe?.webview_likely_playable)) {
-            invoke('open_native_player', { fileId }).catch(() => {});
+            launchNativePlayerOnce();
           }
 
           setErrorCode(code);
@@ -727,7 +850,7 @@ const VideoStreamPlayer: React.FC<{
         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none bg-black/40 backdrop-blur-[1px] z-10">
           <Loader2 className="w-12 h-12 text-cyan-400 animate-spin mb-3" />
           <span className="text-xs font-mono text-cyan-200 bg-slate-900/90 px-3.5 py-1.5 rounded-full border border-cyan-500/30 shadow-lg">
-            {statusMessage || 'Buffering media stream...'}
+            {displayBufferingText}
           </span>
           <div className="flex items-center gap-2 mt-2 text-[10px] font-mono text-slate-400">
             <span className={stage === 'resolving' ? 'text-cyan-400 font-bold' : ''}>1. Resolving</span>
@@ -1014,51 +1137,267 @@ const PdfViewer: React.FC<{
 };
 
 // ============================================================================
-// 3. IMAGE VIEWER (PAN, ZOOM, ROTATE)
+// 3. IMAGE VIEWER (PAN, ZOOM, ROTATE - HIGH PERFORMANCE CANVAS-STYLE NAVIGATION)
 // ============================================================================
 const ImageViewer: React.FC<{
   streamUrl: string;
   fileName: string;
-}> = ({ streamUrl, fileName }) => {
+  onDownload?: () => void;
+}> = ({ streamUrl, fileName, onDownload }) => {
   const [scale, setScale] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
   const [rotation, setRotation] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [isLoading, setIsLoading] = useState(true);
+  const [hasError, setHasError] = useState(false);
+  const maxScale = isAndroid() ? 4 : 10;
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const touchStateRef = useRef<{
+    initialDistance: number;
+    initialScale: number;
+    lastPan: { x: number; y: number };
+    startTouch: { x: number; y: number };
+  }>({
+    initialDistance: 0,
+    initialScale: 1,
+    lastPan: { x: 0, y: 0 },
+    startTouch: { x: 0, y: 0 },
+  });
 
   const rotate = () => setRotation((r) => (r + 90) % 360);
-  const zoomIn = () => setScale((s) => Math.min(5, s + 0.25));
-  const zoomOut = () => setScale((s) => Math.max(0.2, s - 0.25));
+  const zoomIn = () => setScale((s) => Math.min(maxScale, Number((s * 1.25).toFixed(2))));
+  const zoomOut = () => setScale((s) => Math.max(0.1, Number((s / 1.25).toFixed(2))));
   const reset = () => {
     setScale(1);
+    setPan({ x: 0, y: 0 });
     setRotation(0);
   };
+  const setActualSize = () => {
+    setScale(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  // Wheel zoom centered
+  const handleWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const factor = e.deltaY < 0 ? 1.15 : 0.87;
+    setScale((prevScale) => Math.min(maxScale, Math.max(0.1, Number((prevScale * factor).toFixed(2)))));
+  };
+
+  // Mouse pan handlers
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    setIsDragging(true);
+    setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging) return;
+    e.preventDefault();
+    setPan({
+      x: e.clientX - dragStart.x,
+      y: e.clientY - dragStart.y,
+    });
+  };
+
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  // Double click to zoom in/reset
+  const handleDoubleClick = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (scale !== 1 || pan.x !== 0 || pan.y !== 0) {
+      reset();
+    } else {
+      setScale(Math.min(maxScale, 2.5));
+    }
+  };
+
+  // Touch handlers for mobile (pan and pinch-to-zoom)
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      const touch = e.touches[0];
+      touchStateRef.current.startTouch = { x: touch.clientX, y: touch.clientY };
+      touchStateRef.current.lastPan = { ...pan };
+      setIsDragging(true);
+    } else if (e.touches.length === 2) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      touchStateRef.current.initialDistance = dist;
+      touchStateRef.current.initialScale = scale;
+      setIsDragging(false);
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 1 && isDragging) {
+      const touch = e.touches[0];
+      const dx = touch.clientX - touchStateRef.current.startTouch.x;
+      const dy = touch.clientY - touchStateRef.current.startTouch.y;
+      setPan({
+        x: touchStateRef.current.lastPan.x + dx,
+        y: touchStateRef.current.lastPan.y + dy,
+      });
+    } else if (e.touches.length === 2 && touchStateRef.current.initialDistance > 0) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const ratio = dist / touchStateRef.current.initialDistance;
+      const newScale = Math.min(maxScale, Math.max(0.1, Number((touchStateRef.current.initialScale * ratio).toFixed(2))));
+      setScale(newScale);
+    }
+  };
+
+  const handleTouchEnd = () => {
+    setIsDragging(false);
+    touchStateRef.current.initialDistance = 0;
+  };
+
+  if (hasError) {
+    return (
+      <div className="flex flex-col items-center justify-center p-8 text-center max-w-md mx-auto animate-fade-in">
+        <div className="w-16 h-16 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-400 flex items-center justify-center mb-4">
+          <AlertCircle className="w-8 h-8" />
+        </div>
+        <h4 className="text-base font-semibold text-slate-100 mb-2">Unable to Preview Image</h4>
+        <p className="text-xs text-slate-400 mb-5 leading-relaxed">
+          The image stream could not be decoded. You can download the complete original file directly to your device.
+        </p>
+        {onDownload && (
+          <button
+            onClick={onDownload}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition shadow-lg shadow-cyan-500/20 active:scale-95"
+          >
+            <Download className="w-4 h-4" />
+            <span>Download Image</span>
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
-    <div className="w-full h-full flex flex-col bg-slate-950 select-none">
-      <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-slate-800 bg-slate-900/60 text-slate-300 shrink-0">
-        <button onClick={zoomOut} className="p-1.5 rounded hover:bg-slate-800" title="Zoom Out">
+    <div
+      ref={containerRef}
+      onWheel={handleWheel}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseUp}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+      onDoubleClick={handleDoubleClick}
+      className={`relative w-full h-full flex flex-col bg-slate-950 select-none overflow-hidden ${
+        isDragging ? 'cursor-grabbing' : 'cursor-grab'
+      }`}
+    >
+      {/* Floating Glassmorphism Toolbar */}
+      <div className="absolute top-3 right-3 sm:right-6 z-20 flex items-center gap-1 sm:gap-1.5 p-1.5 rounded-2xl bg-slate-900/85 backdrop-blur-md border border-slate-700/80 shadow-2xl text-slate-300">
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            zoomOut();
+          }}
+          className="p-1.5 rounded-xl hover:bg-slate-800 hover:text-white transition active:scale-95"
+          title="Zoom Out (or scroll down)"
+        >
           <ZoomOut className="w-4 h-4" />
         </button>
-        <span className="text-xs font-mono text-cyan-400">{Math.round(scale * 100)}%</span>
-        <button onClick={zoomIn} className="p-1.5 rounded hover:bg-slate-800" title="Zoom In">
+
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            setActualSize();
+          }}
+          className="px-2 py-1 rounded-lg hover:bg-slate-800 text-xs font-mono font-semibold text-cyan-400 transition"
+          title="Click for 100% actual size"
+        >
+          {Math.round(scale * 100)}%
+        </button>
+
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            zoomIn();
+          }}
+          className="p-1.5 rounded-xl hover:bg-slate-800 hover:text-white transition active:scale-95"
+          title="Zoom In (or scroll up)"
+        >
           <ZoomIn className="w-4 h-4" />
         </button>
-        <button onClick={rotate} className="p-1.5 rounded hover:bg-slate-800" title="Rotate 90°">
+
+        <div className="w-[1px] h-4 bg-slate-700/80 mx-0.5" />
+
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            rotate();
+          }}
+          className="p-1.5 rounded-xl hover:bg-slate-800 hover:text-white transition active:scale-95"
+          title="Rotate 90° Clockwise"
+        >
           <RotateIcon className="w-4 h-4" />
         </button>
-        <button onClick={reset} className="px-2 py-1 rounded hover:bg-slate-800 text-xs text-slate-300">
+
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            reset();
+          }}
+          className="px-2.5 py-1 rounded-xl hover:bg-slate-800 text-xs text-slate-300 hover:text-white font-medium transition active:scale-95"
+          title="Reset zoom and position"
+        >
           Reset
         </button>
       </div>
 
-      <div className="flex-1 overflow-auto flex items-center justify-center p-4">
+      {/* Flexible Moving & Zooming Image Stage */}
+      <div className="flex-1 w-full h-full flex items-center justify-center p-4 relative">
+        {isLoading && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none bg-slate-950/60 z-10">
+            <Loader2 className="w-8 h-8 text-cyan-400 animate-spin mb-2" />
+            <span className="text-xs font-mono text-slate-400">Loading image preview...</span>
+          </div>
+        )}
         <img
           src={streamUrl}
           alt={fileName}
-          style={{
-            transform: `scale(${scale}) rotate(${rotation}deg)`,
-            transition: 'transform 0.15s ease-out',
+          draggable={false}
+          onLoad={() => setIsLoading(false)}
+          onError={() => {
+            setIsLoading(false);
+            setHasError(true);
           }}
-          className="max-w-full max-h-full object-contain shadow-2xl rounded-lg"
+          style={{
+            transform: `translate3d(${pan.x}px, ${pan.y}px, 0px) scale(${scale}) rotate(${rotation}deg)`,
+            transition: isDragging ? 'none' : 'transform 0.15s cubic-bezier(0.2, 0, 0, 1)',
+            transformOrigin: 'center center',
+            willChange: scale > 2 ? 'auto' : 'transform',
+          }}
+          className={`max-w-full max-h-full object-contain shadow-2xl rounded-lg pointer-events-none transition-opacity duration-200 ${
+            isLoading ? 'opacity-0' : 'opacity-100'
+          }`}
         />
+      </div>
+
+      {/* Helpful Interactive Hint Strip */}
+      <div className="absolute bottom-3 inset-x-0 pointer-events-none flex justify-center z-10 px-4">
+        <div className="px-3 py-1 rounded-full bg-slate-900/75 backdrop-blur-md border border-slate-800/80 text-[11px] text-slate-400 font-medium shadow-lg flex items-center gap-2">
+          <span>Drag to move</span>
+          <span className="text-slate-600">•</span>
+          <span>Scroll or pinch to zoom</span>
+          <span className="text-slate-600">•</span>
+          <span>Double-click to toggle 2.5x</span>
+        </div>
       </div>
     </div>
   );

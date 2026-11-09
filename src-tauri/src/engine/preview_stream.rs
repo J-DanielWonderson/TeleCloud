@@ -1,9 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::SeekFrom,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -18,21 +18,23 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, Mutex, RwLock, Semaphore},
+    sync::{broadcast, Mutex, Notify, RwLock, Semaphore},
+    task::JoinSet,
 };
 
 use crate::db::schema::{DbManager, FileChunkRecord, FileRecord};
 use crate::engine::media_probe::{
-    evaluate_webview_playability, parse_ebml, parse_isobmff_boxes, parse_moov_payload, MediaProbe,
+    calculate_bitrate_and_mp, evaluate_webview_playability, parse_ebml, parse_isobmff_boxes, parse_moov_payload, MediaProbe,
 };
 use crate::error::AppError;
 use crate::telegram::bot_pool::BotPool;
 use crate::telegram::client::TelegramClientManager;
 use crate::telegram::flood_guard::extract_flood_wait_secs;
 
-pub const BLOCK_SIZE: usize = 512 * 1024; // 512 KB optimal MTProto part size (128 * 4096)
+pub const BLOCK_SIZE: usize = 1024 * 1024; // 1 MB optimal MTProto part size (256 * 4096)
 pub const DEFAULT_MAX_CACHE_ANDROID: u64 = 1024 * 1024 * 1024; // 1 GB
 pub const DEFAULT_MAX_CACHE_DESKTOP: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+pub const MAGIC_TCBMAP03: &[u8; 8] = b"TCBMAP03";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreviewStatusEvent {
@@ -42,6 +44,155 @@ pub struct PreviewStatusEvent {
     pub cached_bytes: u64,
     pub total_bytes: u64,
     pub speed_bps: u64,
+    pub bitrate_bps: Option<u64>,
+    pub lookahead_secs: Option<f64>,
+}
+
+/// Dynamic streaming and buffering state maintained per active file
+pub struct FileStreamState {
+    pub file_id: String,
+    pub generation: u64,
+    pub cancel_flag: Arc<AtomicBool>,
+    pub total_size: u64,
+    pub playhead_bytes: Arc<AtomicU64>,
+    pub last_seek_playhead: Arc<AtomicU64>,
+    pub ewma_throughput_bps: Arc<AtomicU64>,
+    pub last_consumption_history: Arc<Mutex<VecDeque<(Instant, usize)>>>,
+    pub dirty_block_count: Arc<AtomicUsize>,
+    pub last_map_save: Arc<Mutex<Instant>>,
+    pub prefetch_notify: Arc<Notify>,
+    pub sticky_bot_id: Arc<RwLock<Option<String>>>,
+    pub probe: Arc<RwLock<Option<MediaProbe>>>,
+    pub active_in_flight: Arc<AtomicUsize>,
+}
+
+impl FileStreamState {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(Ordering::SeqCst)
+    }
+
+    /// Computes effective bitrate in bits per second:
+    /// avg_bitrate_bps = total_size * 8 / duration_secs from MediaProbe.
+    /// If duration is None (e.g. EBML mkv/webm), falls back to measured consumption rate over last ~10s (floor 8 Mbps).
+    pub async fn get_effective_bitrate_bps(&self) -> u64 {
+        if let Some(ref p) = *self.probe.read().await {
+            if let Some(bps) = p.bitrate_bps {
+                if bps > 0 {
+                    return bps;
+                }
+            }
+        }
+
+        let consumption_bps = self.get_consumption_rate_bps().await;
+        consumption_bps.max(8_000_000) // floor at 8 Mbps until known
+    }
+
+    /// Computes the player byte consumption rate over the trailing ~10 seconds
+    pub async fn get_consumption_rate_bps(&self) -> u64 {
+        let history = self.last_consumption_history.lock().await;
+        let now = Instant::now();
+        let recent_bytes: usize = history
+            .iter()
+            .filter(|(t, _)| now.duration_since(*t).as_secs_f64() <= 10.0)
+            .map(|(_, b)| *b)
+            .sum();
+
+        if let Some((first_t, _)) = history.front() {
+            let elapsed_secs = now.duration_since(*first_t).as_secs_f64().max(1.0);
+            ((recent_bytes as f64 * 8.0) / elapsed_secs.min(10.0)).round() as u64
+        } else {
+            0
+        }
+    }
+
+    pub fn record_consumption(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let history = self.last_consumption_history.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut q = history.lock().await;
+            q.push_back((now, bytes));
+            while let Some((t, _)) = q.front() {
+                if now.duration_since(*t).as_secs_f64() > 12.0 {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+
+    pub fn record_download_throughput(&self, bytes: usize, elapsed: Duration) {
+        if bytes == 0 || elapsed.as_nanos() == 0 {
+            return;
+        }
+        let sample_bps = ((bytes as f64 * 8.0) / elapsed.as_secs_f64()).round() as u64;
+        let prev = self.ewma_throughput_bps.load(Ordering::Relaxed);
+        let updated = if prev == 0 {
+            sample_bps
+        } else {
+            // EWMA formula: 0.25 * sample + 0.75 * prev
+            ((0.25 * sample_bps as f64) + (0.75 * prev as f64)).round() as u64
+        };
+        self.ewma_throughput_bps.store(updated, Ordering::Relaxed);
+    }
+}
+
+/// Calculates time-based read-ahead window bytes and blocks based on bitrate, consumption rate, and throughput
+pub fn calculate_window_params(
+    bitrate_bps: u64,
+    throughput_bps: u64,
+    consumption_rate_bps: u64,
+    cache_quota: u64,
+) -> (u64, usize) {
+    let effective_rate_bps = bitrate_bps.max(consumption_rate_bps).max(1_000_000);
+    let effective_bytes_per_sec = (effective_rate_bps as f64) / 8.0;
+
+    let ratio = if bitrate_bps > 0 {
+        (throughput_bps as f64) / (bitrate_bps as f64)
+    } else {
+        1.0
+    };
+
+    // target_secs defaults to 20s and scales up to 60s as throughput/bitrate drops toward 1.5x (and below)
+    let target_secs = if ratio >= 2.0 {
+        20.0
+    } else if ratio <= 1.0 {
+        60.0
+    } else {
+        60.0 - (ratio - 1.0) * 40.0
+    };
+
+    let raw_window_bytes = (target_secs * effective_bytes_per_sec) as u64;
+    let min_window = 8 * 1024 * 1024; // 8 MB floor
+    let max_window = (128 * 1024 * 1024).min(cache_quota / 4); // min(128 MB, 25% cache quota)
+    let window_bytes = raw_window_bytes.clamp(min_window.min(max_window), max_window);
+    let window_blocks = ((window_bytes + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) as usize;
+
+    (window_bytes, window_blocks)
+}
+
+/// RAII guard that ensures an in-flight fetch key is ALWAYS removed from `active_fetches`,
+/// even if the task is aborted via `in_flight_tasks.abort_all()`.
+struct FetchGuard {
+    active_fetches: Arc<std::sync::Mutex<HashMap<(String, usize), broadcast::Sender<Result<(), String>>>>>,
+    key: (String, usize),
+    sender: Option<broadcast::Sender<Result<(), String>>>,
+    completed: bool,
+}
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        let mut active = self.active_fetches.lock().unwrap_or_else(|p| p.into_inner());
+        active.remove(&self.key);
+        if !self.completed {
+            if let Some(ref tx) = self.sender {
+                let _ = tx.send(Err("In-flight block fetch aborted".to_string()));
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -53,11 +204,13 @@ pub struct PreviewStreamManager {
     preview_cache_dir: PathBuf,
     thumbnail_dir: PathBuf,
     cached_blocks: Arc<RwLock<HashMap<String, HashSet<usize>>>>,
-    active_fetches: Arc<RwLock<HashMap<(String, usize), broadcast::Sender<Result<(), String>>>>>,
+    active_fetches: Arc<std::sync::Mutex<HashMap<(String, usize), broadcast::Sender<Result<(), String>>>>>,
     chunk_locations: Arc<RwLock<HashMap<(String, i32), (tl::enums::InputFileLocation, i32)>>>,
     sticky_bots: Arc<RwLock<HashMap<String, String>>>, // file_id -> bot_id
+    stream_generations: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     cancellation_flags: Arc<std::sync::RwLock<HashMap<String, Arc<AtomicBool>>>>,
     file_metadata_cache: Arc<RwLock<HashMap<String, (FileRecord, Arc<[FileChunkRecord]>)>>>,
+    active_streams: Arc<RwLock<HashMap<String, Arc<FileStreamState>>>>,
     port: Arc<AtomicU16>,
     stream_token: String,
     read_ahead_limit: Arc<AtomicUsize>,
@@ -75,17 +228,13 @@ impl PreviewStreamManager {
         let app_dir = app_handle
             .path()
             .app_cache_dir()
-            .map_err(|e| AppError::Io(format!("Failed to resolve cache dir: {e}")))?;
+            .unwrap_or_else(|_| std::env::temp_dir().join("telecloud_cache"));
 
         let preview_cache_dir = app_dir.join("preview_cache");
         let thumbnail_dir = app_dir.join("thumbnails");
 
-        fs::create_dir_all(&preview_cache_dir)
-            .await
-            .map_err(|e| AppError::Io(format!("Failed to create preview cache dir: {e}")))?;
-        fs::create_dir_all(&thumbnail_dir)
-            .await
-            .map_err(|e| AppError::Io(format!("Failed to create thumbnail dir: {e}")))?;
+        let _ = fs::create_dir_all(&preview_cache_dir).await;
+        let _ = fs::create_dir_all(&thumbnail_dir).await;
 
         // Generate per-session random stream token for localhost access authorization
         let mut rng = rand::thread_rng();
@@ -100,25 +249,90 @@ impl PreviewStreamManager {
             preview_cache_dir,
             thumbnail_dir,
             cached_blocks: Arc::new(RwLock::new(HashMap::new())),
-            active_fetches: Arc::new(RwLock::new(HashMap::new())),
+            active_fetches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             chunk_locations: Arc::new(RwLock::new(HashMap::new())),
             sticky_bots: Arc::new(RwLock::new(HashMap::new())),
+            stream_generations: Arc::new(std::sync::RwLock::new(HashMap::new())),
             cancellation_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
             file_metadata_cache: Arc::new(RwLock::new(HashMap::new())),
+            active_streams: Arc::new(RwLock::new(HashMap::new())),
             port: Arc::new(AtomicU16::new(0)),
             stream_token,
             read_ahead_limit: Arc::new(AtomicUsize::new(3)),
-            global_mtproto_semaphore: Arc::new(Semaphore::new(4)),
+            global_mtproto_semaphore: Arc::new(Semaphore::new(12)),
             rate_limiter_last_tick: Arc::new(Mutex::new(Instant::now())),
         };
 
-        // Run startup LRU eviction
+        // Run periodic LRU cache eviction (starts immediately, repeats every 5 minutes)
         let mgr_evict = mgr.clone();
-        tokio::spawn(async move {
-            let _ = mgr_evict.evict_preview_cache_if_needed().await;
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                let _ = mgr_evict.evict_preview_cache_if_needed().await;
+            }
         });
 
         Ok(mgr)
+    }
+
+    /// Safe fallback PreviewStreamManager
+    pub fn fallback(
+        app_handle: &AppHandle,
+        db: Arc<DbManager>,
+        bot_pool: Arc<BotPool>,
+        telegram: Arc<TelegramClientManager>,
+    ) -> Self {
+        let app_dir = std::env::temp_dir().join("telecloud_preview_fallback");
+        let preview_cache_dir = app_dir.join("preview_cache");
+        let thumbnail_dir = app_dir.join("thumbnails");
+        let _ = std::fs::create_dir_all(&preview_cache_dir);
+        let _ = std::fs::create_dir_all(&thumbnail_dir);
+
+        let mut rng = rand::thread_rng();
+        let token_bytes: [u8; 16] = rng.gen();
+        let stream_token = hex::encode(token_bytes);
+
+        Self {
+            db,
+            bot_pool,
+            _telegram: telegram,
+            app_handle: app_handle.clone(),
+            preview_cache_dir,
+            thumbnail_dir,
+            cached_blocks: Arc::new(RwLock::new(HashMap::new())),
+            active_fetches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            chunk_locations: Arc::new(RwLock::new(HashMap::new())),
+            sticky_bots: Arc::new(RwLock::new(HashMap::new())),
+            stream_generations: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            cancellation_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            file_metadata_cache: Arc::new(RwLock::new(HashMap::new())),
+            active_streams: Arc::new(RwLock::new(HashMap::new())),
+            port: Arc::new(AtomicU16::new(0)),
+            stream_token,
+            read_ahead_limit: Arc::new(AtomicUsize::new(3)),
+            global_mtproto_semaphore: Arc::new(Semaphore::new(12)),
+            rate_limiter_last_tick: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    pub async fn get_stream_state(&self, file_id: &str) -> Option<Arc<FileStreamState>> {
+        self.active_streams.read().await.get(file_id).cloned()
+    }
+
+    pub async fn get_stream_metrics(&self, file_id: &str) -> (u64, f32) {
+        if let Some(state) = self.get_stream_state(file_id).await {
+            let bitrate = state.get_effective_bitrate_bps().await;
+            let throughput = state.ewma_throughput_bps.load(Ordering::Relaxed);
+            let ratio = if bitrate > 0 {
+                (throughput as f32 / bitrate as f32).max(0.1)
+            } else {
+                1.0
+            };
+            (bitrate, ratio)
+        } else {
+            (8_000_000, 1.0)
+        }
     }
 
     pub fn app_handle(&self) -> &AppHandle {
@@ -194,22 +408,27 @@ impl PreviewStreamManager {
                 eprintln!("[PreviewStream] Cancelled preview streaming and prefetch for {file_id}");
             }
         }
+
+        // Notify active prefetch worker to terminate and flush debounced block map
+        let mgr = self.clone();
+        let f_id = file_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            if let Some(state) = mgr.active_streams.write().await.remove(&f_id) {
+                state.cancel_flag.store(true, Ordering::SeqCst);
+                state.prefetch_notify.notify_waiters();
+                let set_snapshot = {
+                    let map = mgr.cached_blocks.read().await;
+                    map.get(&f_id).cloned()
+                };
+                if let Some(set) = set_snapshot {
+                    let map_path = mgr.preview_cache_dir.join(format!("{f_id}.map"));
+                    save_block_map(&map_path, state.total_size, &set).await;
+                }
+            }
+        });
     }
 
-    fn get_or_create_cancel_flag(&self, file_id: &str) -> Arc<AtomicBool> {
-        let mut flags = self
-            .cancellation_flags
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        let flag = flags
-            .entry(file_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone();
-        flag.store(false, Ordering::SeqCst);
-        flag
-    }
-
-    fn is_cancelled(&self, file_id: &str) -> bool {
+    pub fn is_cancelled(&self, file_id: &str) -> bool {
         self.cancellation_flags
             .read()
             .ok()
@@ -267,6 +486,12 @@ impl PreviewStreamManager {
 
         self.cached_blocks.write().await.remove(file_id);
         self.file_metadata_cache.write().await.remove(file_id);
+        if let Ok(mut g) = self.stream_generations.write() {
+            g.remove(file_id);
+        }
+        if let Ok(mut c) = self.cancellation_flags.write() {
+            c.remove(file_id);
+        }
     }
 
     /// Clears the entire preview cache directory
@@ -280,6 +505,38 @@ impl PreviewStreamManager {
         }
         self.cached_blocks.write().await.clear();
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn mark_sparse_win32(file: &File) {
+        use std::os::windows::io::AsRawHandle;
+        extern "system" {
+            fn DeviceIoControl(
+                hDevice: isize,
+                dwIoControlCode: u32,
+                lpInBuffer: *const std::ffi::c_void,
+                nInBufferSize: u32,
+                lpOutBuffer: *mut std::ffi::c_void,
+                nOutBufferSize: u32,
+                lpBytesReturned: *mut u32,
+                lpOverlapped: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+        const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+        let handle = file.as_raw_handle() as isize;
+        let mut bytes_returned: u32 = 0;
+        unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            );
+        }
     }
 
     /// Best-effort cache of head (first 1 MB) and tail (moov) for locally uploaded files
@@ -310,6 +567,8 @@ impl PreviewStreamManager {
             Ok(f) => f,
             Err(_) => return,
         };
+        #[cfg(windows)]
+        Self::mark_sparse_win32(&part_file);
         let _ = part_file.set_len(total_size as u64).await;
 
         let mut cached_set = HashSet::new();
@@ -348,7 +607,7 @@ impl PreviewStreamManager {
         eprintln!("[PreviewStream] Cached local upload head/tail for {file_id}");
     }
 
-    /// Enforces preview cache quota using LRU eviction
+    /// Enforces preview cache quota using LRU eviction based on actual allocated blocks
     async fn evict_preview_cache_if_needed(&self) -> Result<(), AppError> {
         let max_bytes = if cfg!(target_os = "android") {
             DEFAULT_MAX_CACHE_ANDROID
@@ -364,10 +623,20 @@ impl PreviewStreamManager {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("part") {
                 if let Ok(meta) = entry.metadata().await {
-                    let len = meta.len();
-                    total_usage += len;
                     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    files.push((path, len, mtime));
+                    let f_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let allocated_bytes = if let Some(blocks) = self.cached_blocks.read().await.get(&f_id) {
+                        (blocks.len() as u64) * (BLOCK_SIZE as u64)
+                    } else {
+                        let map_path = self.preview_cache_dir.join(format!("{f_id}.map"));
+                        if let Some(blocks) = load_block_map(&map_path, meta.len()).await {
+                            (blocks.len() as u64) * (BLOCK_SIZE as u64)
+                        } else {
+                            meta.len()
+                        }
+                    };
+                    total_usage += allocated_bytes;
+                    files.push((path, allocated_bytes, mtime));
                 }
             }
         }
@@ -378,6 +647,12 @@ impl PreviewStreamManager {
             );
             files.sort_by_key(|(_, _, mtime)| *mtime);
             let target_usage = (max_bytes as f64 * 0.8) as u64;
+            let active_files = self.active_streams.read().await.keys().cloned().collect::<HashSet<_>>();
+            let active_fetches = self
+                .active_fetches
+                .lock()
+                .map(|g| g.keys().map(|(fid, _)| fid.clone()).collect::<HashSet<_>>())
+                .unwrap_or_default();
 
             for (path, len, _) in files {
                 if total_usage <= target_usage {
@@ -385,6 +660,9 @@ impl PreviewStreamManager {
                 }
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     let f_id = stem.to_string();
+                    if active_files.contains(&f_id) || active_fetches.contains(&f_id) {
+                        continue; // Do not evict active streaming or fetching file's cache
+                    }
                     let map_path = self.preview_cache_dir.join(format!("{f_id}.map"));
                     let probe_path = self.preview_cache_dir.join(format!("{f_id}.probe.json"));
                     let _ = fs::remove_file(&path).await;
@@ -460,7 +738,9 @@ impl PreviewStreamManager {
         let t0 = Instant::now();
         eprintln!("[PreviewStream] Preparing preview for {file_id}...");
 
-        let _ = self.get_or_create_cancel_flag(file_id);
+        if self.is_cancelled(file_id) {
+            return Ok(());
+        }
         let (file_record, chunks) = self.get_cached_metadata(file_id).await?;
         let total_size = file_record.total_size_bytes as u64;
         if total_size == 0 || chunks.is_empty() {
@@ -477,55 +757,84 @@ impl PreviewStreamManager {
                 cached_bytes: 0,
                 total_bytes: total_size,
                 speed_bps: 0,
+                bitrate_bps: None,
+                lookahead_secs: None,
             },
         );
 
-        // Select sticky stream bot
-        let (worker_client, worker_id, _bot_username, target_channel_peer) =
-            self.bot_pool.select_worker().await?;
-        self.sticky_bots
-            .write()
-            .await
-            .insert(file_id.to_string(), worker_id.clone());
-
-        // Batch resolve all chunk message IDs in ONE single MTProto call
+        // Batch resolve all chunk message IDs across all active bots in parallel
         let msg_ids: Vec<i32> = chunks
             .iter()
             .filter_map(|c| c.telegram_message_id.map(|id| id as i32))
             .collect();
 
-        let t_lookup = Instant::now();
-        let msgs = worker_client
-            .get_messages_by_id(target_channel_peer, &msg_ids)
-            .await
-            .map_err(|e| AppError::Telegram(format!("Batched get_messages_by_id failed: {e}")))?;
-        eprintln!(
-            "[PreviewStream] Batched lookup for {} chunk messages took {}ms",
-            msg_ids.len(),
-            t_lookup.elapsed().as_millis()
-        );
+        let active_workers = self.bot_pool.get_all_active_workers().await;
+        let primary_worker_id = if let Some(w) = active_workers.first() {
+            w.1.clone()
+        } else {
+            let (_, w_id, _, _) = self.bot_pool.select_worker().await?;
+            w_id
+        };
 
-        let mut primary_dc = 2;
-        let mut first_loc = None;
-        {
-            let mut locs = self.chunk_locations.write().await;
-            for (idx, msg_opt) in msgs.into_iter().enumerate() {
-                if let Some(msg) = msg_opt {
-                    if let Some(media) = msg.media() {
-                        if let Some(loc) = media.to_raw_input_location() {
-                            let dc = media.dc_id().unwrap_or(2);
-                            if first_loc.is_none() {
-                                first_loc = Some(loc.clone());
-                                primary_dc = dc;
-                            }
-                            if idx < msg_ids.len() {
-                                locs.insert((worker_id.clone(), msg_ids[idx]), (loc, dc));
+        self.sticky_bots
+            .write()
+            .await
+            .insert(file_id.to_string(), primary_worker_id.clone());
+
+        // Ensure stream state is initialized for this file
+        let stream_state = self.ensure_stream_state(file_id, total_size, &chunks).await;
+        *stream_state.sticky_bot_id.write().await = Some(primary_worker_id.clone());
+
+        let t_lookup = Instant::now();
+        let mut join_set = JoinSet::new();
+        for (client, w_id, _uname, peer) in active_workers {
+            let ids = msg_ids.clone();
+            join_set.spawn(async move {
+                let msgs_res = client.get_messages_by_id(peer, &ids).await;
+                (client, w_id, msgs_res, ids)
+            });
+        }
+
+        while let Some(join_res) = join_set.join_next().await {
+            if let Ok((client, w_id, Ok(msgs), ids)) = join_res {
+                let mut locs = self.chunk_locations.write().await;
+                let mut first_loc_dc = None;
+                for (idx, msg_opt) in msgs.into_iter().enumerate() {
+                    if let Some(msg) = msg_opt {
+                        if let Some(media) = msg.media() {
+                            if let Some(loc) = media.to_raw_input_location() {
+                                let dc = media.dc_id().unwrap_or(2);
+                                if first_loc_dc.is_none() {
+                                    first_loc_dc = Some((loc.clone(), dc));
+                                }
+                                if idx < ids.len() {
+                                    locs.insert((w_id.clone(), ids[idx]), (loc, dc));
+                                }
                             }
                         }
                     }
                 }
+                drop(locs);
+
+                // Pre-warm primary DC connection for this bot
+                if let Some((loc, dc)) = first_loc_dc {
+                    let req = tl::functions::upload::GetFile {
+                        precise: true,
+                        cdn_supported: false,
+                        location: loc,
+                        offset: 0,
+                        limit: 4096,
+                    };
+                    let _ = client.invoke_in_dc(dc, &req).await;
+                }
             }
         }
+
+        eprintln!(
+            "[PreviewStream] Parallel bot lookup & DC warm-up for {} chunk messages took {}ms",
+            msg_ids.len(),
+            t_lookup.elapsed().as_millis()
+        );
 
         // Emit status: connecting
         let _ = app_handle.emit(
@@ -537,25 +846,10 @@ impl PreviewStreamManager {
                 cached_bytes: 0,
                 total_bytes: total_size,
                 speed_bps: 0,
+                bitrate_bps: None,
+                lookahead_secs: None,
             },
         );
-
-        // Warm DC connection for the sticky stream bot with tiny 4096 request
-        if let Some(loc) = first_loc {
-            let t_dc = Instant::now();
-            let req = tl::functions::upload::GetFile {
-                precise: true,
-                cdn_supported: false,
-                location: loc,
-                offset: 0,
-                limit: 4096,
-            };
-            let _ = worker_client.invoke_in_dc(primary_dc, &req).await;
-            eprintln!(
-                "[PreviewStream] DC {primary_dc} connection warm-up took {}ms",
-                t_dc.elapsed().as_millis()
-            );
-        }
 
         // Emit status: fetching_header
         let _ = app_handle.emit(
@@ -567,6 +861,8 @@ impl PreviewStreamManager {
                 cached_bytes: 0,
                 total_bytes: total_size,
                 speed_bps: 0,
+                bitrate_bps: None,
+                lookahead_secs: None,
             },
         );
 
@@ -621,6 +917,8 @@ impl PreviewStreamManager {
                     cached_bytes: 0,
                     total_bytes: total_size,
                     speed_bps: 0,
+                    bitrate_bps: None,
+                    lookahead_secs: None,
                 },
             );
         });
@@ -654,6 +952,8 @@ impl PreviewStreamManager {
                 width: None,
                 height: None,
                 duration_secs: None,
+                bitrate_bps: None,
+                megapixels: None,
                 moov_at_end: false,
                 moov_offset: None,
                 moov_size: None,
@@ -682,6 +982,8 @@ impl PreviewStreamManager {
                 width: None,
                 height: None,
                 duration_secs: None,
+                bitrate_bps: None,
+                megapixels: None,
                 moov_at_end: false,
                 moov_offset: None,
                 moov_size: None,
@@ -689,6 +991,9 @@ impl PreviewStreamManager {
                 reason,
             };
             let _ = fs::write(&probe_file, serde_json::to_vec(&probe).unwrap_or_default()).await;
+            if let Some(state) = self.get_stream_state(file_id).await {
+                *state.probe.write().await = Some(probe.clone());
+            }
             return Ok(probe);
         }
 
@@ -731,18 +1036,30 @@ impl PreviewStreamManager {
         let mut duration_secs = None;
 
         if let Some(ref mb) = moov_box {
-            // Read entire moov box if needed
-            let moov_bytes = self
-                .read_byte_range(file_id, &file_record, &chunks, mb.offset, mb.offset + mb.size - 1)
-                .await?;
-            if moov_bytes.len() >= mb.header_size as usize {
-                let payload = &moov_bytes[mb.header_size as usize..];
-                let (vc, ac, w, h, dur) = parse_moov_payload(payload);
-                video_codec = vc;
-                audio_codec = ac;
-                width = w;
-                height = h;
-                duration_secs = dur;
+            // Read entire moov box if needed, bounded by 64 MB limit and checked arithmetic
+            const MAX_MOOV_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+            if mb.size <= MAX_MOOV_SIZE && mb.size >= mb.header_size {
+                if let Some(moov_end) = mb.offset.checked_add(mb.size.saturating_sub(1)) {
+                    let clamped_end = moov_end.min(total_size.saturating_sub(1));
+                    if clamped_end >= mb.offset {
+                        if let Ok(moov_bytes) = self
+                            .read_byte_range(file_id, &file_record, &chunks, mb.offset, clamped_end)
+                            .await
+                        {
+                            if moov_bytes.len() >= mb.header_size as usize {
+                                let payload = &moov_bytes[mb.header_size as usize..];
+                                let (vc, ac, w, h, dur) = parse_moov_payload(payload);
+                                video_codec = vc;
+                                audio_codec = ac;
+                                width = w;
+                                height = h;
+                                duration_secs = dur;
+                            }
+                        }
+                    }
+                }
+            } else {
+                eprintln!("[PreviewStream] Skipping moov parsing: size {} exceeds 64 MB limit", mb.size);
             }
         }
 
@@ -758,6 +1075,13 @@ impl PreviewStreamManager {
             audio_codec.as_deref(),
         );
 
+        let (bitrate_bps, megapixels) = calculate_bitrate_and_mp(
+            total_size,
+            duration_secs,
+            width,
+            height,
+        );
+
         let probe = MediaProbe {
             container,
             video_codec,
@@ -765,6 +1089,8 @@ impl PreviewStreamManager {
             width,
             height,
             duration_secs,
+            bitrate_bps,
+            megapixels,
             moov_at_end,
             moov_offset,
             moov_size,
@@ -773,6 +1099,9 @@ impl PreviewStreamManager {
         };
 
         let _ = fs::write(&probe_file, serde_json::to_vec(&probe).unwrap_or_default()).await;
+        if let Some(state) = self.get_stream_state(file_id).await {
+            *state.probe.write().await = Some(probe.clone());
+        }
         Ok(probe)
     }
 
@@ -800,6 +1129,18 @@ impl PreviewStreamManager {
 
         // Initialize block map from disk if not yet loaded in memory
         self.ensure_block_map_loaded(file_id, &map_path, &part_path, total_size).await?;
+
+        // If an active preview stream state exists for this file, track playhead & signal prefetch worker
+        if let Some(stream_state) = self.get_stream_state(file_id).await {
+            let prev_playhead = stream_state.playhead_bytes.swap(start, Ordering::Relaxed);
+            stream_state.record_consumption((clamped_end - start + 1) as usize);
+
+            let seek_diff = (start as i64 - prev_playhead as i64).abs();
+            if seek_diff > (2 * BLOCK_SIZE as i64) || start < prev_playhead {
+                stream_state.last_seek_playhead.store(start, Ordering::Relaxed);
+            }
+            stream_state.prefetch_notify.notify_one();
+        }
 
         let start_block = (start / BLOCK_SIZE as u64) as usize;
         let end_block = (clamped_end / BLOCK_SIZE as u64) as usize;
@@ -844,32 +1185,7 @@ impl PreviewStreamManager {
             }
         }
 
-        // Adaptive background read-ahead prefetch (Phase 1 & 1b)
-        let prefetch_depth = self.read_ahead_limit.load(Ordering::Relaxed).min(8);
-        if prefetch_depth > 0 && !self.is_cancelled(file_id) {
-            let prefetch_self = self.clone();
-            let pf_id = file_id.to_string();
-            let pf_chunks = chunks.to_vec();
-            let pf_part = part_path.clone();
-            let pf_map = map_path.clone();
-            tokio::spawn(async move {
-                let max_b = (total_size / BLOCK_SIZE as u64) as usize;
-                for next_b in (end_block + 1)..=(end_block + prefetch_depth).min(max_b) {
-                    if prefetch_self.is_cancelled(&pf_id) {
-                        break;
-                    }
-                    let is_cached = {
-                        let map = prefetch_self.cached_blocks.read().await;
-                        map.get(&pf_id).map_or(false, |s| s.contains(&next_b))
-                    };
-                    if !is_cached {
-                        let _ = prefetch_self
-                            .fetch_and_cache_block(&pf_id, &pf_chunks, total_size, next_b, &pf_part, &pf_map)
-                            .await;
-                    }
-                }
-            });
-        }
+        // Note: Background lookahead is managed continuously by the dedicated single prefetch worker
 
         // Read requested slice from part file
         let slice_len = (clamped_end - start + 1) as usize;
@@ -904,6 +1220,8 @@ impl PreviewStreamManager {
                 .read(true)
                 .open(part_path)
                 .await?;
+            #[cfg(windows)]
+            Self::mark_sparse_win32(&file);
             let _ = file.set_len(total_size).await;
         }
 
@@ -941,31 +1259,43 @@ impl PreviewStreamManager {
 
         // Synchronize in-flight fetches: only one task downloads a given block, others await completion
         let fetch_key = (file_id.to_string(), block_idx);
-        let (mut waiter_rx, is_leader) = {
-            let mut active = self.active_fetches.write().await;
+        let (waiter_rx, guard_opt) = {
+            let mut active = self.active_fetches.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(sender) = active.get(&fetch_key) {
-                (sender.subscribe(), false)
+                (Some(sender.subscribe()), None)
             } else {
-                let (tx, rx) = broadcast::channel(2);
-                active.insert(fetch_key.clone(), tx);
-                (rx, true)
+                let (tx, _rx) = broadcast::channel(2);
+                active.insert(fetch_key.clone(), tx.clone());
+                let guard = FetchGuard {
+                    active_fetches: Arc::clone(&self.active_fetches),
+                    key: fetch_key.clone(),
+                    sender: Some(tx),
+                    completed: false,
+                };
+                (None, Some(guard))
             }
         };
 
-        if !is_leader {
+        if let Some(mut rx) = waiter_rx {
             // Await broadcast from leader task
-            match waiter_rx.recv().await {
+            match rx.recv().await {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(err_msg)) => return Err(AppError::Telegram(err_msg)),
                 Err(_) => {
-                    // Leader dropped or finished
+                    // Leader dropped or finished; check if cached
                     let map = self.cached_blocks.read().await;
                     if map.get(file_id).map_or(false, |s| s.contains(&block_idx)) {
                         return Ok(());
                     }
+                    return Err(AppError::Telegram("In-flight block fetch aborted by leader".to_string()));
                 }
             }
         }
+
+        let mut guard = match guard_opt {
+            Some(g) => g,
+            None => return Ok(()),
+        };
 
         // Bounded concurrency + rate limit for MTProto preview calls
         let _permit = self.global_mtproto_semaphore.acquire().await.ok();
@@ -974,58 +1304,92 @@ impl PreviewStreamManager {
         let block_end = ((block_idx + 1) * BLOCK_SIZE as usize).min(total_size as usize) as u64;
         let block_bytes_to_fetch = (block_end - block_global_offset) as usize;
 
+        let t_fetch = Instant::now();
         let fetch_res = self
             .fetch_block_bytes(file_id, chunks, block_global_offset, block_bytes_to_fetch)
             .await;
 
         match fetch_res {
             Ok(block_data) => {
+                let fetch_elapsed = t_fetch.elapsed();
+                if let Some(state) = self.get_stream_state(file_id).await {
+                    state.record_download_throughput(block_data.len(), fetch_elapsed);
+                }
+
                 // Write block to part file at positional global offset
                 let mut file = OpenOptions::new().write(true).open(part_path).await?;
                 file.seek(SeekFrom::Start(block_global_offset)).await?;
                 file.write_all(&block_data).await?;
                 file.flush().await?;
 
-                // Update in-memory set and persist block map
-                {
+                // Debounced persistence: update in-memory set and check save conditions
+                let should_save = if let Some(state) = self.get_stream_state(file_id).await {
                     let mut map = self.cached_blocks.write().await;
                     let set = map.entry(file_id.to_string()).or_default();
                     set.insert(block_idx);
-                    let _ = save_block_map(map_path, total_size, set).await;
+
+                    let dirty = state.dirty_block_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    let mut last_save = state.last_map_save.lock().await;
+                    if dirty >= 32 || last_save.elapsed() >= Duration::from_secs(1) {
+                        state.dirty_block_count.store(0, Ordering::Relaxed);
+                        *last_save = Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    let mut map = self.cached_blocks.write().await;
+                    let set = map.entry(file_id.to_string()).or_default();
+                    set.insert(block_idx);
+                    true
+                }; // cached_blocks write lock DROPPED HERE!
+
+                if should_save {
+                    let set_snapshot = {
+                        let map = self.cached_blocks.read().await;
+                        map.get(file_id).cloned()
+                    };
+                    if let Some(set) = set_snapshot {
+                        let _ = save_block_map(map_path, total_size, &set).await;
+                    }
                 }
 
-                // Notify all concurrent waiters
-                if let Some(tx) = self.active_fetches.write().await.remove(&fetch_key) {
+                // Notify all concurrent waiters BEFORE guard drops
+                if let Some(ref tx) = guard.sender {
                     let _ = tx.send(Ok(()));
                 }
-
-                // AIMD success adaptation: grow read-ahead limit up to 8
-                let curr = self.read_ahead_limit.load(Ordering::Relaxed);
-                if curr < 8 {
-                    self.read_ahead_limit.fetch_add(1, Ordering::Relaxed);
-                }
+                guard.completed = true;
+                drop(guard);
 
                 Ok(())
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if let Some(tx) = self.active_fetches.write().await.remove(&fetch_key) {
+                // Notify all concurrent waiters BEFORE guard drops
+                if let Some(ref tx) = guard.sender {
                     let _ = tx.send(Err(err_str));
                 }
+                guard.completed = true;
+                drop(guard);
                 Err(e)
             }
         }
     }
 
+    /// Rate limiter: reserves future time slot under lock and sleeps outside the mutex
     async fn apply_rate_limit(&self) {
-        let mut last_tick = self.rate_limiter_last_tick.lock().await;
-        let elapsed = last_tick.elapsed();
-        // Min 30ms between MTProto preview requests (conservative ceiling ~33 req/s)
-        let min_interval = Duration::from_millis(30);
-        if elapsed < min_interval {
-            tokio::time::sleep(min_interval - elapsed).await;
+        let min_interval = Duration::from_millis(25);
+        let scheduled_time = {
+            let mut last_tick = self.rate_limiter_last_tick.lock().await;
+            let now = Instant::now();
+            let target = (*last_tick + min_interval).max(now);
+            *last_tick = target;
+            target
+        }; // Lock released immediately!
+        let now = Instant::now();
+        if scheduled_time > now {
+            tokio::time::sleep(scheduled_time - now).await;
         }
-        *last_tick = Instant::now();
     }
 
     /// Fetches byte range across chunk boundary if needed
@@ -1052,11 +1416,18 @@ impl PreviewStreamManager {
             let c_len = chunk.byte_length as u64;
             let offset_in_chunk = curr_offset - c_start;
             let available_in_chunk = (c_len - offset_in_chunk) as usize;
-            let to_fetch = remaining.min(available_in_chunk);
+            let to_fetch = remaining.min(available_in_chunk).min(512 * 1024);
 
             let part_data = self
                 .fetch_chunk_slice_with_retries(file_id, chunk, offset_in_chunk, to_fetch)
                 .await?;
+
+            if part_data.is_empty() {
+                return Err(AppError::Telegram(format!(
+                    "Fetch returned 0 bytes for file {file_id} chunk {} at offset {offset_in_chunk}",
+                    chunk.chunk_index
+                )));
+            }
 
             accumulated.extend_from_slice(&part_data);
             curr_offset += part_data.len() as u64;
@@ -1084,20 +1455,21 @@ impl PreviewStreamManager {
         while attempts < MAX_ATTEMPTS {
             attempts += 1;
 
-            // Use sticky stream bot if available, otherwise select worker excluding failed bots
-            let sticky_bot_id = self.sticky_bots.read().await.get(file_id).cloned();
-            let is_sticky_valid = match sticky_bot_id.as_ref() {
-                Some(id) => attempts == 1 && !excluded_bots.contains(id),
-                None => false,
+            // Use sticky stream bot directly if available (fast-path without round-robin)
+            let sticky_bot_id = {
+                if let Some(state) = self.get_stream_state(file_id).await {
+                    state.sticky_bot_id.read().await.clone()
+                } else {
+                    self.sticky_bots.read().await.get(file_id).cloned()
+                }
             };
             let (worker_client, worker_id, _bot_username, target_channel_peer) =
-                if is_sticky_valid {
-                    match self.bot_pool.select_worker().await {
-                        Ok(w) => w,
-                        Err(e) => {
-                            eprintln!("[PreviewStream] Sticky worker acquire error: {e}");
-                            self.bot_pool.select_worker_excluding(&excluded_bots).await?
-                        }
+                if attempts == 1 && sticky_bot_id.is_some() && !excluded_bots.contains(sticky_bot_id.as_ref().unwrap()) {
+                    let s_id = sticky_bot_id.unwrap();
+                    if let Some(w) = self.bot_pool.get_worker_by_id(&s_id).await {
+                        w
+                    } else {
+                        self.bot_pool.select_worker_excluding(&excluded_bots).await?
                     }
                 } else {
                     self.bot_pool.select_worker_excluding(&excluded_bots).await?
@@ -1167,7 +1539,7 @@ impl PreviewStreamManager {
             let aligned_offset = (chunk_offset / 4096) * 4096;
             let offset_delta = (chunk_offset - aligned_offset) as usize;
             let raw_len = limit + offset_delta;
-            let aligned_limit = (((raw_len + 4095) / 4096) * 4096).min(1024 * 1024);
+            let aligned_limit = (((raw_len + 4095) / 4096) * 4096).min(512 * 1024);
 
             let req = tl::functions::upload::GetFile {
                 precise: true,
@@ -1244,6 +1616,326 @@ impl PreviewStreamManager {
             chunk.chunk_index, chunk_offset
         )))
     }
+
+    /// Retrieves or initializes stream state, launching dedicated prefetch and metrics logger
+    pub async fn ensure_stream_state(
+        &self,
+        file_id: &str,
+        total_size: u64,
+        chunks: &[FileChunkRecord],
+    ) -> Arc<FileStreamState> {
+        {
+            let map = self.active_streams.read().await;
+            if let Some(state) = map.get(file_id) {
+                if !state.is_cancelled() {
+                    return state.clone();
+                }
+            }
+        }
+
+        let mut map = self.active_streams.write().await;
+        if let Some(state) = map.get(file_id) {
+            if !state.is_cancelled() {
+                return state.clone();
+            }
+        }
+
+        let (generation, cancel_flag) = {
+            let mut gen_map = self.stream_generations.write().unwrap_or_else(|p| p.into_inner());
+            let gen = gen_map.entry(file_id.to_string()).and_modify(|g| *g += 1).or_insert(1);
+            let mut flags = self.cancellation_flags.write().unwrap_or_else(|p| p.into_inner());
+            if let Some(old_flag) = flags.get(file_id) {
+                old_flag.store(true, Ordering::SeqCst);
+            }
+            let new_flag = Arc::new(AtomicBool::new(false));
+            flags.insert(file_id.to_string(), new_flag.clone());
+            (*gen, new_flag)
+        };
+
+        let sticky_id = self.sticky_bots.read().await.get(file_id).cloned();
+
+        let state = Arc::new(FileStreamState {
+            file_id: file_id.to_string(),
+            generation,
+            cancel_flag,
+            total_size,
+            playhead_bytes: Arc::new(AtomicU64::new(0)),
+            last_seek_playhead: Arc::new(AtomicU64::new(0)),
+            ewma_throughput_bps: Arc::new(AtomicU64::new(0)),
+            last_consumption_history: Arc::new(Mutex::new(VecDeque::new())),
+            dirty_block_count: Arc::new(AtomicUsize::new(0)),
+            last_map_save: Arc::new(Mutex::new(Instant::now())),
+            prefetch_notify: Arc::new(Notify::new()),
+            sticky_bot_id: Arc::new(RwLock::new(sticky_id)),
+            probe: Arc::new(RwLock::new(None)),
+            active_in_flight: Arc::new(AtomicUsize::new(0)),
+        });
+
+        map.insert(file_id.to_string(), state.clone());
+
+        // Spawn dedicated single prefetch worker for this active file
+        let part_path = self.preview_cache_dir.join(format!("{}.part", file_id));
+        let map_path = self.preview_cache_dir.join(format!("{}.map", file_id));
+        let mgr_worker = self.clone();
+        let state_worker = state.clone();
+        let chunks_arc: Arc<[FileChunkRecord]> = chunks.to_vec().into();
+        tokio::spawn(async move {
+            run_prefetch_worker(mgr_worker, state_worker, chunks_arc, part_path, map_path).await;
+        });
+
+        // Spawn 1-second periodic stats logger
+        let mgr_logger = self.clone();
+        let state_logger = state.clone();
+        let log_file_id = file_id.to_string();
+        tokio::spawn(async move {
+            run_stats_logger(mgr_logger, state_logger, log_file_id).await;
+        });
+
+        state
+    }
+}
+
+/// Single prefetch worker per file: keeps adaptive N in-flight fetches, fills nearest playhead first
+async fn run_prefetch_worker(
+    mgr: PreviewStreamManager,
+    state: Arc<FileStreamState>,
+    chunks: Arc<[FileChunkRecord]>,
+    part_path: PathBuf,
+    map_path: PathBuf,
+) {
+    let file_id = state.file_id.clone();
+    let total_size = state.total_size;
+    let max_b = if total_size == 0 {
+        0
+    } else {
+        ((total_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) as usize - 1
+    };
+
+    let cache_quota = if cfg!(target_os = "android") {
+        DEFAULT_MAX_CACHE_ANDROID
+    } else {
+        DEFAULT_MAX_CACHE_DESKTOP
+    };
+
+    let mut in_flight_tasks = JoinSet::new();
+    let mut failed_blocks: HashMap<usize, (Instant, Duration)> = HashMap::new();
+
+    while !state.is_cancelled() && !mgr.is_cancelled(&file_id) {
+        let playhead = state.playhead_bytes.load(Ordering::Relaxed);
+        let playhead_block = (playhead / BLOCK_SIZE as u64) as usize;
+
+        let bitrate_bps = state.get_effective_bitrate_bps().await;
+        let throughput_bps = state.ewma_throughput_bps.load(Ordering::Relaxed);
+        let consumption_bps = state.get_consumption_rate_bps().await;
+
+        let (_window_bytes, window_blocks) = calculate_window_params(
+            bitrate_bps,
+            throughput_bps,
+            consumption_bps,
+            cache_quota,
+        );
+
+        let window_end_block = (playhead_block + window_blocks).min(max_b);
+
+        // Identify missing blocks nearest to playhead first
+        let mut missing_blocks = Vec::new();
+        {
+            let map = mgr.cached_blocks.read().await;
+            if let Some(cached) = map.get(&file_id) {
+                for b in playhead_block..=window_end_block {
+                    if !cached.contains(&b) {
+                        missing_blocks.push(b);
+                    }
+                }
+            } else {
+                for b in playhead_block..=window_end_block {
+                    missing_blocks.push(b);
+                }
+            }
+        }
+
+        // Bounded concurrency N in [2, 6], bounded by active bots
+        let active_bots = mgr.bot_pool.get_all_active_workers().await.len().max(1);
+        let max_concurrency = active_bots.clamp(2, 6);
+
+        let now = Instant::now();
+        let mut to_dispatch = Vec::new();
+        {
+            let active = mgr.active_fetches.lock().unwrap_or_else(|p| p.into_inner());
+            for b in missing_blocks {
+                if let Some((retry_at, _)) = failed_blocks.get(&b) {
+                    if now < *retry_at {
+                        continue;
+                    }
+                }
+                let key = (file_id.clone(), b);
+                if !active.contains_key(&key) {
+                    to_dispatch.push(b);
+                    if in_flight_tasks.len() + to_dispatch.len() >= max_concurrency {
+                        break;
+                    }
+                }
+            }
+        }
+
+        for b in to_dispatch {
+            let mgr_clone = mgr.clone();
+            let f_id = file_id.clone();
+            let ch_vec = chunks.to_vec();
+            let p_path = part_path.clone();
+            let m_path = map_path.clone();
+            let state_clone = state.clone();
+
+            state.active_in_flight.fetch_add(1, Ordering::Relaxed);
+            in_flight_tasks.spawn(async move {
+                let res = mgr_clone
+                    .fetch_and_cache_block(&f_id, &ch_vec, total_size, b, &p_path, &m_path)
+                    .await;
+                state_clone.active_in_flight.fetch_sub(1, Ordering::Relaxed);
+                (b, res)
+            });
+        }
+
+        if in_flight_tasks.is_empty() {
+            let sleep_dur = failed_blocks
+                .values()
+                .map(|(retry_at, _)| retry_at.saturating_duration_since(Instant::now()))
+                .min()
+                .unwrap_or(Duration::from_millis(500))
+                .max(Duration::from_millis(50))
+                .min(Duration::from_millis(500));
+
+            tokio::select! {
+                _ = state.prefetch_notify.notified() => {},
+                _ = tokio::time::sleep(sleep_dur) => {},
+            }
+        } else {
+            tokio::select! {
+                Some(join_res) = in_flight_tasks.join_next() => {
+                    if let Ok((b, res)) = join_res {
+                        match res {
+                            Ok(_) => {
+                                failed_blocks.remove(&b);
+                            }
+                            Err(err) => {
+                                let next_backoff = if let Some((_, prev_backoff)) = failed_blocks.get(&b) {
+                                    (*prev_backoff * 2).min(Duration::from_millis(5000))
+                                } else {
+                                    Duration::from_millis(200)
+                                };
+                                eprintln!("[PrefetchWorker] Block {b} failed ({err}); backing off for {:?}", next_backoff);
+                                failed_blocks.insert(b, (Instant::now() + next_backoff, next_backoff));
+                            }
+                        }
+                    }
+                }
+                _ = state.prefetch_notify.notified() => {
+                    // Playhead moved or seek detected: loop will re-evaluate target window
+                }
+            }
+        }
+    }
+
+    in_flight_tasks.abort_all();
+    let set_snapshot = {
+        let map = mgr.cached_blocks.read().await;
+        map.get(&file_id).cloned()
+    };
+    if let Some(set) = set_snapshot {
+        let _ = save_block_map(&map_path, total_size, &set).await;
+    }
+}
+
+/// 1-second periodic logger: logs stats and emits preview://status
+async fn run_stats_logger(
+    mgr: PreviewStreamManager,
+    state: Arc<FileStreamState>,
+    file_id: String,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.tick().await;
+
+    let cache_quota = if cfg!(target_os = "android") {
+        DEFAULT_MAX_CACHE_ANDROID
+    } else {
+        DEFAULT_MAX_CACHE_DESKTOP
+    };
+
+    while !state.is_cancelled() && !mgr.is_cancelled(&file_id) {
+        ticker.tick().await;
+
+        let bitrate_bps = state.get_effective_bitrate_bps().await;
+        let throughput_bps = state.ewma_throughput_bps.load(Ordering::Relaxed);
+        let consumption_bps = state.get_consumption_rate_bps().await;
+        let playhead_bytes = state.playhead_bytes.load(Ordering::Relaxed);
+        let in_flight = state.active_in_flight.load(Ordering::Relaxed);
+
+        let (window_bytes, _) = calculate_window_params(
+            bitrate_bps,
+            throughput_bps,
+            consumption_bps,
+            cache_quota,
+        );
+
+        let cached_ahead_bytes = {
+            let map = mgr.cached_blocks.read().await;
+            if let Some(set) = map.get(&file_id) {
+                let start_b = (playhead_bytes / BLOCK_SIZE as u64) as usize;
+                let max_b = (state.total_size / BLOCK_SIZE as u64) as usize;
+                let mut contiguous: u64 = 0;
+                for b in start_b..=max_b {
+                    if set.contains(&b) {
+                        contiguous += BLOCK_SIZE as u64;
+                    } else {
+                        break;
+                    }
+                }
+                contiguous
+            } else {
+                0
+            }
+        };
+
+        let bytes_per_sec = (bitrate_bps as f64 / 8.0).max(1.0);
+        let ahead_secs = cached_ahead_bytes as f64 / bytes_per_sec;
+
+        eprintln!(
+            "[StreamStats {}] bitrate: {:.2} Mbps | throughput: {:.2} MB/s | window: {:.1} MB | in_flight: {} | ahead: {:.1}s",
+            file_id,
+            bitrate_bps as f64 / 1_000_000.0,
+            (throughput_bps as f64 / 8.0) / (1024.0 * 1024.0),
+            window_bytes as f64 / (1024.0 * 1024.0),
+            in_flight,
+            ahead_secs
+        );
+
+        let is_slow = throughput_bps > 0 && throughput_bps < bitrate_bps;
+        let stage_str = if is_slow && ahead_secs < 2.5 {
+            "buffering".to_string()
+        } else {
+            "ready".to_string()
+        };
+
+        let msg = if is_slow {
+            format!("Network slower than video bitrate, buffering ({ahead_secs:.0}s cached)...")
+        } else {
+            "Streaming".to_string()
+        };
+
+        let _ = mgr.app_handle.emit(
+            "preview://status",
+            PreviewStatusEvent {
+                file_id: file_id.clone(),
+                stage: stage_str,
+                message: msg,
+                cached_bytes: cached_ahead_bytes,
+                total_bytes: state.total_size,
+                speed_bps: throughput_bps,
+                bitrate_bps: Some(bitrate_bps),
+                lookahead_secs: Some(ahead_secs),
+            },
+        );
+    }
 }
 
 /// Helper to serialize cached block set to compact bitmap on disk
@@ -1259,7 +1951,7 @@ async fn save_block_map(path: &Path, total_size: u64, cached_blocks: &HashSet<us
     }
 
     let mut data = Vec::with_capacity(24 + bitmap.len());
-    data.extend_from_slice(b"TCBMAP02");
+    data.extend_from_slice(MAGIC_TCBMAP03);
     data.extend_from_slice(&total_size.to_be_bytes());
     data.extend_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
     data.extend_from_slice(&(num_blocks as u32).to_be_bytes());
@@ -1271,13 +1963,18 @@ async fn save_block_map(path: &Path, total_size: u64, cached_blocks: &HashSet<us
 /// Helper to load cached block set from bitmap on disk
 async fn load_block_map(path: &Path, expected_size: u64) -> Option<HashSet<usize>> {
     let data = fs::read(path).await.ok()?;
-    if data.len() < 24 || &data[0..8] != b"TCBMAP02" {
+    if data.len() < 24 || &data[0..8] != MAGIC_TCBMAP03 {
         return None;
     }
     let stored_size = u64::from_be_bytes([
         data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
     ]);
     if stored_size != expected_size {
+        return None;
+    }
+
+    let stored_block_size = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
+    if stored_block_size != BLOCK_SIZE {
         return None;
     }
 
@@ -1655,10 +2352,14 @@ async fn handle_stream_route(
         }
     };
 
-    // Grant larger streamed windows (up to 8-16 MB per request)
-    let max_window = 16 * 1024 * 1024;
-    let end = req_end.min(start + max_window - 1).min(total_size.saturating_sub(1));
-    let content_len = if total_size == 0 { 0 } else { end - start + 1 };
+    // Grant larger streamed windows (up to 16 MB per request) ONLY when Range header is present
+    let end = if is_range {
+        let max_window = 16 * 1024 * 1024u64;
+        req_end.min(start.saturating_add(max_window.saturating_sub(1))).min(total_size.saturating_sub(1))
+    } else {
+        total_size.saturating_sub(1)
+    };
+    let content_len = if total_size == 0 || start > end { 0 } else { end - start + 1 };
 
     let header = if is_range {
         format!(
@@ -1726,12 +2427,18 @@ async fn handle_stream_route(
                 }
                 if let Err(e) = stream.write_all(&bytes).await {
                     eprintln!("[PreviewStream] Socket write error: {e}");
+                    let _ = stream.shutdown().await;
                     return Ok(false);
                 }
-                let _ = stream.flush().await;
+                if let Err(e) = stream.flush().await {
+                    eprintln!("[PreviewStream] Socket flush error: {e}");
+                    let _ = stream.shutdown().await;
+                    return Ok(false);
+                }
             }
             Err(e) => {
                 eprintln!("[PreviewStream] Stream block fetch failed: {e}");
+                let _ = stream.shutdown().await;
                 return Ok(false);
             }
         }
@@ -1790,8 +2497,73 @@ mod tests {
 
     #[test]
     fn test_block_alignment() {
-        assert_eq!(BLOCK_SIZE, 512 * 1024);
+        assert_eq!(BLOCK_SIZE, 1024 * 1024); // 1 MB
         assert_eq!(BLOCK_SIZE % 4096, 0); // Must be a multiple of 4KB
         assert!(BLOCK_SIZE <= 1024 * 1024); // Must be <= 1MB
+    }
+
+    #[test]
+    fn test_calculate_window_params() {
+        let quota = 2 * 1024 * 1024 * 1024; // 2 GB desktop
+
+        // Healthy throughput (30 Mbps) vs 10 Mbps video -> ratio 3.0 >= 2.0 -> target 20s
+        // 20s * (10 Mbps / 8) = 25 MB
+        let (bytes_healthy, blocks_healthy) = calculate_window_params(10_000_000, 30_000_000, 0, quota);
+        assert_eq!(bytes_healthy, 25_000_000);
+        assert_eq!(blocks_healthy, 24); // 25 MB in 1 MB blocks
+
+        // Constrained network (10 Mbps) vs 10 Mbps video -> ratio 1.0 <= 1.0 -> target 60s
+        // 60s * (10 Mbps / 8) = 75 MB
+        let (bytes_slow, blocks_slow) = calculate_window_params(10_000_000, 10_000_000, 0, quota);
+        assert_eq!(bytes_slow, 75_000_000);
+        assert_eq!(blocks_slow, 72);
+
+        // Clamping to floor: 1 Mbps video -> 20s * 125 KB = 2.5 MB -> clamped to 8 MB floor
+        let (bytes_floor, blocks_floor) = calculate_window_params(1_000_000, 5_000_000, 0, quota);
+        assert_eq!(bytes_floor, 8 * 1024 * 1024);
+        assert_eq!(blocks_floor, 8);
+
+        // Clamping to ceiling: 60 Mbps 4K video slow network -> 60s * 7.5 MB = 450 MB -> clamped to 128 MB max
+        let (bytes_ceil, blocks_ceil) = calculate_window_params(60_000_000, 40_000_000, 0, quota);
+        assert_eq!(bytes_ceil, 128 * 1024 * 1024);
+        assert_eq!(blocks_ceil, 128);
+    }
+
+    #[tokio::test]
+    async fn test_block_map_v3_validation() {
+        let temp_dir = std::env::temp_dir();
+        let map_path = temp_dir.join("test_block_map_v3.map");
+        let total_size = 10 * 1024 * 1024u64; // 10 MB
+
+        let mut initial_blocks = HashSet::new();
+        initial_blocks.insert(0);
+        initial_blocks.insert(2);
+        initial_blocks.insert(5);
+
+        // Save with TCBMAP03
+        save_block_map(&map_path, total_size, &initial_blocks).await;
+
+        // Load and verify
+        let loaded = load_block_map(&map_path, total_size).await;
+        assert!(loaded.is_some());
+        let set = loaded.unwrap();
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&0));
+        assert!(set.contains(&2));
+        assert!(set.contains(&5));
+
+        // Test rejection on wrong total_size
+        let wrong_size = load_block_map(&map_path, 20 * 1024 * 1024).await;
+        assert!(wrong_size.is_none());
+
+        // Test rejection on old TCBMAP02 magic
+        let mut raw = tokio::fs::read(&map_path).await.unwrap();
+        raw[0..8].copy_from_slice(b"TCBMAP02");
+        tokio::fs::write(&map_path, &raw).await.unwrap();
+
+        let old_magic = load_block_map(&map_path, total_size).await;
+        assert!(old_magic.is_none());
+
+        let _ = tokio::fs::remove_file(map_path).await;
     }
 }

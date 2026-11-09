@@ -120,6 +120,7 @@ pub struct RusqliteSession {
 impl RusqliteSession {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RusqliteSessionError> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS dc_home (

@@ -37,21 +37,27 @@ class NativePlayerActivity : AppCompatActivity() {
 
     private var streamUrl: String = ""
     private var videoTitle: String = ""
+    private var bitrateBps: Long = 0L
+    private var throughputRatio: Float = 1.0f
 
     companion object {
         const val TAG = "NativePlayerActivity"
         const val EXTRA_STREAM_URL = "STREAM_URL"
         const val EXTRA_TITLE = "TITLE"
+        const val EXTRA_BITRATE_BPS = "BITRATE_BPS"
+        const val EXTRA_THROUGHPUT_RATIO = "THROUGHPUT_RATIO"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Keep screen on on all API levels while video player activity is active
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         streamUrl = intent.getStringExtra(EXTRA_STREAM_URL) ?: ""
         videoTitle = intent.getStringExtra(EXTRA_TITLE) ?: "Video Preview"
-
-        // Setup full screen immersive flags
-        hideSystemUI()
+        bitrateBps = intent.getLongExtra(EXTRA_BITRATE_BPS, 0L)
+        throughputRatio = intent.getFloatExtra(EXTRA_THROUGHPUT_RATIO, 1.0f)
 
         val root = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -141,6 +147,21 @@ class NativePlayerActivity : AppCompatActivity() {
         root.addView(errorLayout)
 
         setContentView(root)
+        hideSystemUI()
+        initializePlayer()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        streamUrl = intent.getStringExtra(EXTRA_STREAM_URL) ?: ""
+        videoTitle = intent.getStringExtra(EXTRA_TITLE) ?: "Video Preview"
+        bitrateBps = intent.getLongExtra(EXTRA_BITRATE_BPS, 0L)
+        throughputRatio = intent.getFloatExtra(EXTRA_THROUGHPUT_RATIO, 1.0f)
+
+        playerView?.player = null
+        player?.release()
+        player = null
         initializePlayer()
     }
 
@@ -157,9 +178,27 @@ class NativePlayerActivity : AppCompatActivity() {
                 .setReadTimeoutMs(30_000)
                 .setAllowCrossProtocolRedirects(true)
 
-            // Buffer configuration: 15s min, 60s max, 1.5s playback start, 3s rebuffer
+            // Dynamic buffer configuration based on bitrate and throughput ratio:
+            // Buffer for playback: 3 to 8s, rebuffer: 8 to 15s, max buffer up to 120s
+            // If throughput < bitrate (ratio < 1.0), pre-roll longer before starting playback
+            val (startBufferMs, rebufferMs, minBufferMs) = if (throughputRatio < 1.0f) {
+                val factor = (1.0f - throughputRatio).coerceIn(0.0f, 1.0f)
+                val start = (5_000 + factor * 3_000).toInt() // 5,000ms to 8,000ms
+                val rebuf = (10_000 + factor * 5_000).toInt() // 10,000ms to 15,000ms
+                Triple(start, rebuf, 30_000)
+            } else if (throughputRatio < 1.5f) {
+                val factor = ((1.5f - throughputRatio) / 0.5f).coerceIn(0.0f, 1.0f)
+                val start = (3_000 + factor * 2_000).toInt() // 3,000ms to 5,000ms
+                val rebuf = (8_000 + factor * 2_000).toInt()  // 8,000ms to 10,000ms
+                Triple(start, rebuf, 25_000)
+            } else {
+                Triple(3_000, 8_000, 20_000)
+            }
+            val maxBufferMs = 120_000
+
             val loadControl = DefaultLoadControl.Builder()
-                .setBufferDurationsMs(15_000, 60_000, 1_500, 3_000)
+                .setBufferDurationsMs(minBufferMs, maxBufferMs, startBufferMs, rebufferMs)
+                .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
 
             val mediaSourceFactory = DefaultMediaSourceFactory(httpDataSourceFactory)
@@ -215,6 +254,7 @@ class NativePlayerActivity : AppCompatActivity() {
     }
 
     private fun hideSystemUI() {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.insetsController?.let {
                 it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
@@ -230,8 +270,6 @@ class NativePlayerActivity : AppCompatActivity() {
                     or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     or View.SYSTEM_UI_FLAG_FULLSCREEN
             )
-            @Suppress("DEPRECATION")
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 
@@ -248,8 +286,8 @@ class NativePlayerActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        playerView?.player = null
         player?.release()
         player = null
-        playerView?.player = null
     }
 }

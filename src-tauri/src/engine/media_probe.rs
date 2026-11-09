@@ -8,6 +8,8 @@ pub struct MediaProbe {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub duration_secs: Option<f64>,
+    pub bitrate_bps: Option<u64>,
+    pub megapixels: Option<f64>,
     pub moov_at_end: bool,
     pub moov_offset: Option<u64>,
     pub moov_size: Option<u64>,
@@ -35,7 +37,10 @@ pub fn parse_isobmff_boxes(data: &[u8], base_offset: u64, total_file_size: u64) 
     let mut cursor = 0usize;
 
     while cursor + 8 <= data.len() {
-        let box_start = base_offset + cursor as u64;
+        let box_start = match base_offset.checked_add(cursor as u64) {
+            Some(s) => s,
+            None => break,
+        };
         let size_u32 = u32::from_be_bytes([data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]]);
         let fourcc = [data[cursor + 4], data[cursor + 5], data[cursor + 6], data[cursor + 7]];
 
@@ -65,12 +70,16 @@ pub fn parse_isobmff_boxes(data: &[u8], base_offset: u64, total_file_size: u64) 
             header_size,
         });
 
-        // Advance cursor
-        if box_size > data.len() as u64 - cursor as u64 {
+        // Advance cursor with checked bounds
+        let remaining = (data.len().saturating_sub(cursor)) as u64;
+        if box_size > remaining {
             // Box extends beyond current buffer
             break;
         }
-        cursor += box_size as usize;
+        cursor = match cursor.checked_add(box_size as usize) {
+            Some(c) => c,
+            None => break,
+        };
     }
 
     boxes
@@ -91,21 +100,30 @@ pub fn parse_moov_payload(moov_data: &[u8]) -> (Option<String>, Option<String>, 
             moov_data[cursor], moov_data[cursor + 1], moov_data[cursor + 2], moov_data[cursor + 3],
         ]);
         let fourcc = &moov_data[cursor + 4..cursor + 8];
-        let box_size = if size_u32 == 1 && cursor + 16 <= moov_data.len() {
-            u64::from_be_bytes([
+        let (box_size, header_size) = if size_u32 == 1 && cursor + 16 <= moov_data.len() {
+            let largesize = u64::from_be_bytes([
                 moov_data[cursor + 8], moov_data[cursor + 9], moov_data[cursor + 10], moov_data[cursor + 11],
                 moov_data[cursor + 12], moov_data[cursor + 13], moov_data[cursor + 14], moov_data[cursor + 15],
-            ]) as usize
+            ]);
+            (usize::try_from(largesize).unwrap_or(usize::MAX), 16usize)
         } else {
-            size_u32 as usize
+            (size_u32 as usize, 8usize)
         };
 
-        if box_size < 8 || cursor + box_size > moov_data.len() {
+        let box_end = match cursor.checked_add(box_size) {
+            Some(e) => e,
+            None => break,
+        };
+
+        if box_size < header_size || box_end > moov_data.len() {
             break;
         }
 
-        let payload_start = if size_u32 == 1 { cursor + 16 } else { cursor + 8 };
-        let payload = &moov_data[payload_start..cursor + box_size];
+        let payload_start = match cursor.checked_add(header_size) {
+            Some(p) => p,
+            None => break,
+        };
+        let payload = &moov_data[payload_start..box_end];
 
         if fourcc == b"mvhd" {
             if let Some(dur) = parse_mvhd(payload) {
@@ -125,7 +143,7 @@ pub fn parse_moov_payload(moov_data: &[u8]) -> (Option<String>, Option<String>, 
             }
         }
 
-        cursor += box_size;
+        cursor = box_end;
     }
 
     (video_codec, audio_codec, width, height, duration_secs)
@@ -171,14 +189,18 @@ fn parse_trak(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
     while cursor + 8 <= payload.len() {
         let size = u32::from_be_bytes([payload[cursor], payload[cursor + 1], payload[cursor + 2], payload[cursor + 3]]) as usize;
         let fourcc = &payload[cursor + 4..cursor + 8];
-        if size < 8 || cursor + size > payload.len() {
+        let next_cursor = match cursor.checked_add(size) {
+            Some(c) => c,
+            None => break,
+        };
+        if size < 8 || next_cursor > payload.len() {
             break;
         }
-        let box_data = &payload[cursor + 8..cursor + size];
+        let box_data = &payload[cursor + 8..next_cursor];
 
-        if fourcc == b"tkhd" && box_data.len() >= 84 {
+        if fourcc == b"tkhd" && !box_data.is_empty() {
             let version = box_data[0];
-            let offset = if version == 1 { 84 } else { 72 };
+            let offset = if version == 1 { 88 } else { 76 };
             if box_data.len() >= offset + 8 {
                 let w = u32::from_be_bytes([box_data[offset], box_data[offset + 1], box_data[offset + 2], box_data[offset + 3]]) >> 16;
                 let h = u32::from_be_bytes([box_data[offset + 4], box_data[offset + 5], box_data[offset + 6], box_data[offset + 7]]) >> 16;
@@ -195,7 +217,7 @@ fn parse_trak(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
             if height.is_none() && mh.is_some() { height = mh; }
         }
 
-        cursor += size;
+        cursor = next_cursor;
     }
 
     (video_codec, audio_codec, width, height)
@@ -211,10 +233,14 @@ fn parse_mdia(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
     while cursor + 8 <= payload.len() {
         let size = u32::from_be_bytes([payload[cursor], payload[cursor + 1], payload[cursor + 2], payload[cursor + 3]]) as usize;
         let fourcc = &payload[cursor + 4..cursor + 8];
-        if size < 8 || cursor + size > payload.len() {
+        let next_cursor = match cursor.checked_add(size) {
+            Some(c) => c,
+            None => break,
+        };
+        if size < 8 || next_cursor > payload.len() {
             break;
         }
-        let box_data = &payload[cursor + 8..cursor + size];
+        let box_data = &payload[cursor + 8..next_cursor];
 
         if fourcc == b"minf" {
             let (vc, ac, mw, mh) = parse_minf(box_data);
@@ -226,7 +252,7 @@ fn parse_mdia(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
             }
         }
 
-        cursor += size;
+        cursor = next_cursor;
     }
 
     (video_codec, audio_codec, width, height)
@@ -237,16 +263,20 @@ fn parse_minf(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
     while cursor + 8 <= payload.len() {
         let size = u32::from_be_bytes([payload[cursor], payload[cursor + 1], payload[cursor + 2], payload[cursor + 3]]) as usize;
         let fourcc = &payload[cursor + 4..cursor + 8];
-        if size < 8 || cursor + size > payload.len() {
+        let next_cursor = match cursor.checked_add(size) {
+            Some(c) => c,
+            None => break,
+        };
+        if size < 8 || next_cursor > payload.len() {
             break;
         }
-        let box_data = &payload[cursor + 8..cursor + size];
+        let box_data = &payload[cursor + 8..next_cursor];
 
         if fourcc == b"stbl" {
             return parse_stbl(box_data);
         }
 
-        cursor += size;
+        cursor = next_cursor;
     }
     (None, None, None, None)
 }
@@ -256,16 +286,20 @@ fn parse_stbl(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
     while cursor + 8 <= payload.len() {
         let size = u32::from_be_bytes([payload[cursor], payload[cursor + 1], payload[cursor + 2], payload[cursor + 3]]) as usize;
         let fourcc = &payload[cursor + 4..cursor + 8];
-        if size < 8 || cursor + size > payload.len() {
+        let next_cursor = match cursor.checked_add(size) {
+            Some(c) => c,
+            None => break,
+        };
+        if size < 8 || next_cursor > payload.len() {
             break;
         }
-        let box_data = &payload[cursor + 8..cursor + size];
+        let box_data = &payload[cursor + 8..next_cursor];
 
         if fourcc == b"stsd" {
             return parse_stsd(box_data);
         }
 
-        cursor += size;
+        cursor = next_cursor;
     }
     (None, None, None, None)
 }
@@ -291,11 +325,15 @@ fn parse_stsd(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
         let format_fourcc = &payload[cursor + 4..cursor + 8];
         let format_str = String::from_utf8_lossy(format_fourcc).to_string();
 
-        if entry_size < 8 || cursor + entry_size > payload.len() {
+        let next_cursor = match cursor.checked_add(entry_size) {
+            Some(c) => c,
+            None => break,
+        };
+        if entry_size < 8 || next_cursor > payload.len() {
             break;
         }
 
-        let entry_payload = &payload[cursor + 8..cursor + entry_size];
+        let entry_payload = &payload[cursor + 8..next_cursor];
 
         // Identify video formats
         let is_video = matches!(
@@ -322,7 +360,7 @@ fn parse_stsd(payload: &[u8]) -> (Option<String>, Option<String>, Option<u32>, O
             audio_codec = Some(format_str);
         }
 
-        cursor += entry_size;
+        cursor = next_cursor;
     }
 
     (video_codec, audio_codec, width, height)
@@ -436,6 +474,30 @@ pub fn evaluate_webview_playability(
     (true, "Video track appears standard (H.264 / AAC / WebM) and compatible with system WebView.".to_string())
 }
 
+/// Computes average bitrate (bps) and megapixels (MP) from media metadata
+pub fn calculate_bitrate_and_mp(
+    total_size_bytes: u64,
+    duration_secs: Option<f64>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> (Option<u64>, Option<f64>) {
+    let bitrate_bps = duration_secs.and_then(|dur| {
+        if dur > 0.0 && total_size_bytes > 0 {
+            Some((total_size_bytes as f64 * 8.0 / dur).round() as u64)
+        } else {
+            None
+        }
+    });
+
+    let megapixels = match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            Some(((w as f64 * h as f64) / 1_000_000.0 * 100.0).round() / 100.0)
+        }
+        _ => None,
+    };
+
+    (bitrate_bps, megapixels)
+}
 
 #[cfg(test)]
 mod tests {
@@ -448,6 +510,27 @@ mod tests {
         b.extend_from_slice(fourcc);
         b.extend_from_slice(payload);
         b
+    }
+
+    #[test]
+    fn test_calculate_bitrate_and_mp() {
+        // 1080p video: 1920x1080, 150 MB (157,286,400 bytes), 60 seconds -> ~20.97 Mbps
+        let total_size = 157_286_400u64;
+        let (bitrate, mp) = calculate_bitrate_and_mp(total_size, Some(60.0), Some(1920), Some(1080));
+        assert!(bitrate.is_some());
+        let bps = bitrate.unwrap();
+        assert_eq!(bps, 20_971_520); // 157286400 * 8 / 60
+        assert_eq!(mp, Some(2.07));
+
+        // 4K video: 3840x2160, 1 GB (1,073,741,824 bytes), 120 seconds -> ~71.58 Mbps
+        let (bitrate_4k, mp_4k) = calculate_bitrate_and_mp(1_073_741_824, Some(120.0), Some(3840), Some(2160));
+        assert_eq!(mp_4k, Some(8.29));
+        assert!(bitrate_4k.unwrap() > 70_000_000);
+
+        // Missing duration (e.g. EBML initial state) -> None bitrate
+        let (bitrate_ebml, mp_ebml) = calculate_bitrate_and_mp(100_000_000, None, Some(1280), Some(720));
+        assert!(bitrate_ebml.is_none());
+        assert_eq!(mp_ebml, Some(0.92));
     }
 
     #[test]
@@ -493,5 +576,23 @@ mod tests {
 
         let (mkv_playable, _) = evaluate_webview_playability("matroska", Some("avc1"), Some("mp4a"));
         assert!(!mkv_playable);
+    }
+
+    #[test]
+    fn test_tkhd_dimensions_parsing() {
+        // Build version 0 tkhd box (84 bytes payload)
+        let mut tkhd_payload = vec![0u8; 84];
+        tkhd_payload[0] = 0; // version 0
+        // width 1920 at offset 76: (1920 << 16)
+        let w_fixed = 1920u32 << 16;
+        tkhd_payload[76..80].copy_from_slice(&w_fixed.to_be_bytes());
+        // height 1080 at offset 80: (1080 << 16)
+        let h_fixed = 1080u32 << 16;
+        tkhd_payload[80..84].copy_from_slice(&h_fixed.to_be_bytes());
+
+        let tkhd_box = build_box(b"tkhd", &tkhd_payload);
+        let (_, _, w, h) = parse_trak(&tkhd_box);
+        assert_eq!(w, Some(1920));
+        assert_eq!(h, Some(1080));
     }
 }

@@ -91,6 +91,24 @@ impl BotPool {
         })
     }
 
+    /// Safe fallback BotPool that operates with fallback temporary session path
+    pub fn fallback(
+        keystore: Arc<Keystore>,
+        db: Arc<DbManager>,
+        master_manager: Arc<TelegramClientManager>,
+    ) -> Self {
+        let session_dir = std::env::temp_dir().join("telecloud_bot_session_fallback");
+        let _ = std::fs::create_dir_all(&session_dir);
+        Self {
+            keystore,
+            db,
+            master_manager,
+            session_dir,
+            workers: Arc::new(RwLock::new(Vec::new())),
+            round_robin_idx: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     /// Resolves the storage channel PeerRef for a specific bot client using pure MTProto GetChannels
     pub async fn resolve_bot_channel_peer(client: &Client, channel_id: i64) -> Result<PeerRef, AppError> {
         let res = client
@@ -296,6 +314,59 @@ impl BotPool {
     /// Falls back to the master user account if no bots are registered or if all are cooling down.
     pub async fn select_worker(&self) -> Result<(Client, String, String, PeerRef), AppError> {
         self.select_worker_excluding(&[]).await
+    }
+
+    /// Returns all currently active workers (not in cooldown) for parallel pre-warming and streaming
+    pub async fn get_all_active_workers(&self) -> Vec<(Client, String, String, PeerRef)> {
+        let now = current_unix_timestamp();
+        let workers_guard = self.workers.read().await;
+        let mut list = Vec::new();
+        for worker in workers_guard.iter() {
+            if worker.is_active && worker.cooldown_until <= now {
+                let formatted_username = if worker.bot_username.starts_with('@') {
+                    worker.bot_username.clone()
+                } else {
+                    format!("@{}", worker.bot_username)
+                };
+                if let Some(ref peer) = worker.channel_peer {
+                    list.push((worker.client.clone(), worker.bot_id.clone(), formatted_username, peer.clone()));
+                }
+            }
+        }
+        if list.is_empty() {
+            if let Ok(master_client) = self.master_manager.get_client().await {
+                if let Ok(master_peer) = self.master_manager.resolve_storage_channel_peer_ref().await {
+                    list.push((master_client, "master".to_string(), "Master Account".to_string(), master_peer));
+                }
+            }
+        }
+        list
+    }
+
+    /// Directly retrieves a specific worker if active and not cooling down (for truly sticky bot selection)
+    pub async fn get_worker_by_id(&self, target_id: &str) -> Option<(Client, String, String, PeerRef)> {
+        let now = current_unix_timestamp();
+        let workers_guard = self.workers.read().await;
+        if let Some(worker) = workers_guard.iter().find(|w| w.bot_id == target_id) {
+            if worker.is_active && worker.cooldown_until <= now {
+                let formatted_username = if worker.bot_username.starts_with('@') {
+                    worker.bot_username.clone()
+                } else {
+                    format!("@{}", worker.bot_username)
+                };
+                if let Some(ref peer) = worker.channel_peer {
+                    return Some((worker.client.clone(), worker.bot_id.clone(), formatted_username, peer.clone()));
+                }
+            }
+        }
+        if target_id == "master" {
+            if let Ok(master_client) = self.master_manager.get_client().await {
+                if let Ok(master_peer) = self.master_manager.resolve_storage_channel_peer_ref().await {
+                    return Some((master_client, "master".to_string(), "Master Account".to_string(), master_peer));
+                }
+            }
+        }
+        None
     }
 
     /// Selects next available worker client, prioritizing bots not in `excluded_bot_ids`.

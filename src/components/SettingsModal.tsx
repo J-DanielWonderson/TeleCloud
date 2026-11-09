@@ -27,10 +27,25 @@ interface SettingsModalProps {
   onClose: () => void;
   onOpenFeedback?: () => void;
   onBotsUpdated?: () => void;
+  onCheckUpdates?: () => void;
 }
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onOpenFeedback, onBotsUpdated }) => {
-  const [activeTab, setActiveTab] = useState<'bots' | 'sync' | 'storage' | 'feedback'>('bots');
+export const SettingsModal: React.FC<SettingsModalProps> = ({
+  isOpen,
+  onClose,
+  onOpenFeedback,
+  onBotsUpdated,
+  onCheckUpdates,
+}) => {
+  const [activeTab, setActiveTab] = useState<'bots' | 'sync' | 'storage' | 'feedback' | 'updates'>('bots');
+  const [autoUpdateEnabled, setAutoUpdateEnabled] = useState<boolean>(() => {
+    return localStorage.getItem('telecloud_auto_update_check') !== 'false';
+  });
+
+  const handleToggleAutoUpdate = (val: boolean) => {
+    setAutoUpdateEnabled(val);
+    localStorage.setItem('telecloud_auto_update_check', val ? 'true' : 'false');
+  };
   const [bots, setBots] = useState<WorkerBotInfo[]>([]);
   const [poolHealth, setPoolHealth] = useState<BotPoolHealth | null>(null);
   const [loadingBots, setLoadingBots] = useState<boolean>(false);
@@ -46,6 +61,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
   // Chunk Size State
   const [chunkSizeMb, setChunkSizeMb] = useState<number>(250);
   const [savingChunk, setSavingChunk] = useState<boolean>(false);
+
+  // Debug Logging State
+  const [debugLogPath, setDebugLogPath] = useState<string>('');
+  const [debugLogs, setDebugLogs] = useState<string | null>(null);
+  const [loadingLogs, setLoadingLogs] = useState<boolean>(false);
+  const [copiedLogs, setCopiedLogs] = useState<boolean>(false);
+
+  const fetchDebugLogPath = async () => {
+    try {
+      const p = await invoke<string>('get_debug_log_path');
+      setDebugLogPath(p);
+    } catch (_e) {}
+  };
+
+  const handleLoadLogs = async () => {
+    try {
+      setLoadingLogs(true);
+      const text = await invoke<string>('get_debug_logs');
+      setDebugLogs(text);
+    } catch (e: any) {
+      setDebugLogs(`Error retrieving logs: ${e?.message || String(e)}`);
+    } finally {
+      setLoadingLogs(false);
+    }
+  };
+
+  const handleCopyLogs = () => {
+    if (debugLogs) {
+      navigator.clipboard.writeText(debugLogs);
+      setCopiedLogs(true);
+      setTimeout(() => setCopiedLogs(false), 2000);
+    }
+  };
 
   const fetchBots = async () => {
     try {
@@ -94,6 +142,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
       fetchBots();
       fetchSyncStatus();
       fetchChunkConfig();
+      fetchDebugLogPath();
     }
   }, [isOpen]);
 
@@ -245,6 +294,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
           >
             <MessageSquare className="w-4 h-4" />
             Feedback & Support
+          </button>
+          <button
+            onClick={() => setActiveTab('updates')}
+            className={`py-3 flex items-center gap-2 border-b-2 transition whitespace-nowrap shrink-0 ${
+              activeTab === 'updates'
+                ? 'border-cyan-400 text-cyan-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Sparkles className="w-4 h-4" />
+            Updates & Release
           </button>
         </div>
 
@@ -570,6 +630,122 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
                     Submissions are automatically tagged with <code className="text-cyan-300 font-mono">user-feedback</code>, <code className="text-amber-300 font-mono">enhancement</code>, or <code className="text-rose-300 font-mono">bug</code> for prompt team review.
                   </p>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 5: UPDATES & RELEASES */}
+          {activeTab === 'updates' && (
+            <div className="space-y-6">
+              <div className="p-4 rounded-xl bg-vault-850 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold text-white flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4 text-cyan-400" />
+                    TeleCloud Update Engine
+                  </h3>
+                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                    v1.2.3 Installed
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  TeleCloud checks the official GitHub repository releases to provide seamless, user-permitted updates.
+                  Android packages are signed with a permanent release keystore to ensure zero package signature conflicts.
+                </p>
+
+                <div className="pt-2">
+                  <button
+                    onClick={() => {
+                      if (onCheckUpdates) {
+                        onClose();
+                        onCheckUpdates();
+                      }
+                    }}
+                    className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white text-xs font-semibold shadow-md shadow-cyan-500/20 transition cursor-pointer active:scale-95"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    <span>Check for Updates Now</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Preferences */}
+              <div className="p-4 rounded-xl bg-vault-950/60 border border-slate-800 flex items-center justify-between">
+                <div>
+                  <div className="text-xs font-semibold text-white">Auto-Check on Startup</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">
+                    Check GitHub releases when TeleCloud launches and ask for your permission if an update is found
+                  </div>
+                </div>
+
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoUpdateEnabled}
+                    onChange={(e) => handleToggleAutoUpdate(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-500"></div>
+                </label>
+              </div>
+
+              {/* Diagnostics & Debug Logs */}
+              <div className="p-4 rounded-xl bg-vault-950/60 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold text-white flex items-center gap-1.5">
+                    <ShieldAlert className="w-4 h-4 text-cyan-400" />
+                    Diagnostics & On-Device Debug Logs
+                  </div>
+                  <span className="text-[10px] text-emerald-400 font-mono bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                    Active
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  Debug and error logs are automatically preserved on device to assist troubleshooting.
+                </p>
+                {debugLogPath && (
+                  <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 font-mono text-[10px] text-slate-300 break-all select-all">
+                    {debugLogPath}
+                  </div>
+                )}
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleLoadLogs}
+                    disabled={loadingLogs}
+                    className="flex-1 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-xs font-medium transition flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    {loadingLogs ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                    <span>{debugLogs ? 'Refresh Logs' : 'View Logs'}</span>
+                  </button>
+                  {debugLogs && (
+                    <button
+                      type="button"
+                      onClick={handleCopyLogs}
+                      className="py-2 px-3 rounded-lg bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300 text-xs font-medium border border-cyan-500/30 transition flex items-center gap-1.5 cursor-pointer"
+                    >
+                      {copiedLogs ? <CheckCircle className="w-3.5 h-3.5 text-emerald-400" /> : null}
+                      <span>{copiedLogs ? 'Copied!' : 'Copy Logs'}</span>
+                    </button>
+                  )}
+                </div>
+                {debugLogs && (
+                  <div className="mt-2 p-3 rounded-lg bg-slate-950 border border-slate-800 max-h-48 overflow-y-auto font-mono text-[10px] text-slate-300 whitespace-pre-wrap select-all">
+                    {debugLogs}
+                  </div>
+                )}
+              </div>
+
+              {/* GitHub Link */}
+              <div className="p-3.5 rounded-xl bg-vault-950/60 border border-slate-800 flex items-center justify-between text-xs">
+                <span className="text-slate-400">Release Channel:</span>
+                <a
+                  href="https://github.com/J-DanielWonderson/TeleCloud/releases"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-cyan-400 hover:underline flex items-center gap-1 font-mono text-[11px]"
+                >
+                  github.com/J-DanielWonderson/TeleCloud
+                </a>
               </div>
             </div>
           )}

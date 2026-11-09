@@ -146,40 +146,61 @@ pub async fn get_telegram_me(
 }
 
 #[tauri::command]
-pub fn get_vault_config(
+pub async fn get_vault_config(
     key: String,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<Option<String>, AppError> {
-    db.get_config(&key)
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || db.get_config(&key))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 #[tauri::command]
-pub fn set_chunk_size(
+pub async fn set_chunk_size(
     chunk_size_bytes: i64,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<(), AppError> {
     if chunk_size_bytes < 100 * 1024 * 1024 || chunk_size_bytes > 500 * 1024 * 1024 {
         return Err(AppError::Validation("Chunk size must be between 100MB and 500MB".into()));
     }
-    db.set_config("chunk_size_bytes", &chunk_size_bytes.to_string())
+    if chunk_size_bytes % (1024 * 1024) != 0 {
+        return Err(AppError::Validation("Chunk size must be an exact multiple of 1 MiB (1,048,576 bytes)".into()));
+    }
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || {
+        db.set_config("chunk_size_bytes", &chunk_size_bytes.to_string())
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 #[tauri::command]
-pub fn list_folders(
+pub async fn list_folders(
     parent_id: Option<String>,
     is_trashed: Option<bool>,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<Vec<FolderRecord>, AppError> {
-    db.list_folders(parent_id.as_deref(), is_trashed.unwrap_or(false))
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || {
+        db.list_folders(parent_id.as_deref(), is_trashed.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 #[tauri::command]
-pub fn list_files(
+pub async fn list_files(
     folder_id: Option<String>,
     is_trashed: Option<bool>,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<Vec<FileRecord>, AppError> {
-    db.list_files(folder_id.as_deref(), is_trashed.unwrap_or(false))
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || {
+        db.list_files(folder_id.as_deref(), is_trashed.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 fn trigger_auto_cloud_sync(cloud_sync: &Arc<CloudSyncManager>, app_handle: &AppHandle) {
@@ -195,7 +216,7 @@ fn trigger_auto_cloud_sync(cloud_sync: &Arc<CloudSyncManager>, app_handle: &AppH
 }
 
 #[tauri::command]
-pub fn create_folder(
+pub async fn create_folder(
     parent_id: Option<String>,
     name: String,
     color: Option<String>,
@@ -219,63 +240,174 @@ pub fn create_folder(
         is_trashed: 0,
     };
 
-    db.create_folder(&record)?;
+    let db = Arc::clone(&*db);
+    let rec = record.clone();
+    tauri::async_runtime::spawn_blocking(move || db.create_folder(&rec))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
+
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
     Ok(record)
 }
 
 #[tauri::command]
-pub fn get_folder_breadcrumbs(
+pub async fn get_folder_breadcrumbs(
     folder_id: Option<String>,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<Vec<BreadcrumbItem>, AppError> {
-    db.get_breadcrumbs(folder_id.as_deref())
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || db.get_breadcrumbs(folder_id.as_deref()))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 #[tauri::command]
-pub fn get_subfolders(
+pub async fn get_subfolders(
     parent_id: Option<String>,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<Vec<FolderRecord>, AppError> {
-    db.list_folders(parent_id.as_deref(), false)
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || db.list_folders(parent_id.as_deref(), false))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 #[tauri::command]
-pub fn get_files_in_folder(
+pub async fn get_files_in_folder(
     folder_id: Option<String>,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<Vec<FileRecord>, AppError> {
-    db.list_files(folder_id.as_deref(), false)
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || db.list_files(folder_id.as_deref(), false))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 #[tauri::command]
-pub fn move_folder(
+pub async fn move_folder(
     id: String,
     target_folder_id: Option<String>,
     db: State<'_, Arc<DbManager>>,
     cloud_sync: State<'_, Arc<CloudSyncManager>>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    db.move_folder(&id, target_folder_id.as_deref())?;
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let target_c = target_folder_id.clone();
+    tauri::async_runtime::spawn_blocking(move || db.move_folder(&id_c, target_c.as_deref()))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
     Ok(())
 }
 
 #[tauri::command]
-pub fn move_file(
+pub async fn move_file(
     id: String,
     target_folder_id: Option<String>,
     db: State<'_, Arc<DbManager>>,
     cloud_sync: State<'_, Arc<CloudSyncManager>>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    db.move_file(&id, target_folder_id.as_deref())?;
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let target_c = target_folder_id.clone();
+    tauri::async_runtime::spawn_blocking(move || db.move_file(&id_c, target_c.as_deref()))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
     Ok(())
 }
 
 #[tauri::command]
-pub fn rename_folder(
+pub async fn copy_folder(
+    id: String,
+    target_folder_id: Option<String>,
+    db: State<'_, Arc<DbManager>>,
+    cloud_sync: State<'_, Arc<CloudSyncManager>>,
+    app_handle: AppHandle,
+) -> Result<FolderRecord, AppError> {
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let target_c = target_folder_id.clone();
+    let copied = tauri::async_runtime::spawn_blocking(move || db.copy_folder(&id_c, target_c.as_deref()))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
+    trigger_auto_cloud_sync(&cloud_sync, &app_handle);
+    Ok(copied)
+}
+
+#[tauri::command]
+pub async fn copy_file(
+    id: String,
+    target_folder_id: Option<String>,
+    db: State<'_, Arc<DbManager>>,
+    cloud_sync: State<'_, Arc<CloudSyncManager>>,
+    app_handle: AppHandle,
+) -> Result<FileRecord, AppError> {
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let target_c = target_folder_id.clone();
+    let copied = tauri::async_runtime::spawn_blocking(move || db.copy_file(&id_c, target_c.as_deref()))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
+    trigger_auto_cloud_sync(&cloud_sync, &app_handle);
+    Ok(copied)
+}
+
+#[tauri::command]
+pub fn save_update_temp_file(
+    filename: String,
+    data_base64: String,
+) -> Result<String, AppError> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|e| AppError::Validation(format!("Invalid base64 payload: {e}")))?;
+
+    #[cfg(target_os = "android")]
+    let dir = match crate::android_bridge::bridge::get_downloads_dir() {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::env::temp_dir(),
+    };
+    #[cfg(not(target_os = "android"))]
+    let dir = std::env::temp_dir();
+
+    let target_path = dir.join(&filename);
+    std::fs::write(&target_path, decoded).map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn install_update_package(file_path: String) -> Result<(), AppError> {
+    #[cfg(target_os = "android")]
+    {
+        crate::android_bridge::bridge::install_apk(&file_path);
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new(&file_path)
+                .spawn()
+                .map_err(|e| AppError::Io(e.to_string()))?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn rename_folder(
     id: String,
     new_name: String,
     db: State<'_, Arc<DbManager>>,
@@ -286,30 +418,44 @@ pub fn rename_folder(
     if trimmed.is_empty() {
         return Err(AppError::Validation("Folder name cannot be empty".into()));
     }
-    db.rename_folder(&id, trimmed)?;
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let name_c = trimmed.to_string();
+    tauri::async_runtime::spawn_blocking(move || db.rename_folder(&id_c, &name_c))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_folder(
+pub async fn delete_folder(
     id: String,
     permanent: Option<bool>,
     db: State<'_, Arc<DbManager>>,
     cloud_sync: State<'_, Arc<CloudSyncManager>>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    if permanent.unwrap_or(false) {
-        db.delete_folder_permanent(&id)?;
-    } else {
-        db.set_folder_trashed(&id, true)?;
-    }
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let is_perm = permanent.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        if is_perm {
+            db.delete_folder_permanent(&id_c)
+        } else {
+            db.set_folder_trashed(&id_c, true)
+        }
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+    ?;
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
     Ok(())
 }
 
 #[tauri::command]
-pub fn rename_file(
+pub async fn rename_file(
     id: String,
     new_name: String,
     db: State<'_, Arc<DbManager>>,
@@ -320,13 +466,19 @@ pub fn rename_file(
     if trimmed.is_empty() {
         return Err(AppError::Validation("File name cannot be empty".into()));
     }
-    db.rename_file(&id, trimmed)?;
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let name_c = trimmed.to_string();
+    tauri::async_runtime::spawn_blocking(move || db.rename_file(&id_c, &name_c))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_file(
+pub async fn delete_file(
     id: String,
     permanent: Option<bool>,
     db: State<'_, Arc<DbManager>>,
@@ -334,14 +486,23 @@ pub fn delete_file(
     stream_mgr: State<'_, Arc<PreviewStreamManager>>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    if permanent.unwrap_or(false) {
-        db.delete_file_permanent(&id)?;
-    } else {
-        db.set_file_trashed(&id, true)?;
-    }
+    let db = Arc::clone(&*db);
+    let id_c = id.clone();
+    let is_perm = permanent.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        if is_perm {
+            db.delete_file_permanent(&id_c)
+        } else {
+            db.set_file_trashed(&id_c, true)
+        }
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+    ?;
+
     let mgr = Arc::clone(&*stream_mgr);
     let f_id = id.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         mgr.delete_file_cache(&f_id).await;
     });
     trigger_auto_cloud_sync(&cloud_sync, &app_handle);
@@ -349,11 +510,14 @@ pub fn delete_file(
 }
 
 #[tauri::command]
-pub fn get_file_chunks(
+pub async fn get_file_chunks(
     file_id: String,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<Vec<FileChunkRecord>, AppError> {
-    db.get_chunks_for_file(&file_id)
+    let db = Arc::clone(&*db);
+    tauri::async_runtime::spawn_blocking(move || db.get_chunks_for_file(&file_id))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
 }
 
 #[tauri::command]
@@ -687,7 +851,7 @@ pub async fn prepare_preview(
     stream_mgr: State<'_, Arc<PreviewStreamManager>>,
 ) -> Result<(), AppError> {
     let mgr = Arc::clone(&*stream_mgr);
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         if let Err(e) = mgr.prepare_preview(&file_id, &app_handle).await {
             eprintln!("[PreviewStream] prepare_preview error for {file_id}: {e}");
         }
@@ -696,7 +860,7 @@ pub async fn prepare_preview(
 }
 
 #[tauri::command]
-pub fn cancel_preview(
+pub async fn cancel_preview(
     file_id: String,
     stream_mgr: State<'_, Arc<PreviewStreamManager>>,
 ) -> Result<(), AppError> {
@@ -712,35 +876,57 @@ pub async fn clear_preview_cache(
 }
 
 #[tauri::command]
-pub fn open_native_player(
+pub async fn open_native_player(
     file_id: String,
     stream_mgr: State<'_, Arc<PreviewStreamManager>>,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<bool, AppError> {
+    if let Ok((file_record, chunks)) = stream_mgr.get_cached_metadata(&file_id).await {
+        stream_mgr
+            .ensure_stream_state(&file_id, file_record.total_size_bytes as u64, &chunks)
+            .await;
+    }
     let url = stream_mgr.get_stream_url(&file_id);
     let title = db
         .get_file(&file_id)?
         .map(|f| f.name)
         .unwrap_or_else(|| "Video".into());
-    crate::android_bridge::open_native_player(&url, &title);
+    let (bitrate_bps, ratio) = stream_mgr.get_stream_metrics(&file_id).await;
+    crate::android_bridge::open_native_player(&url, &title, bitrate_bps as i64, ratio);
     Ok(true)
 }
 
 #[tauri::command]
-pub fn open_external_player(
+pub async fn open_external_player(
     file_id: String,
     stream_mgr: State<'_, Arc<PreviewStreamManager>>,
     db: State<'_, Arc<DbManager>>,
 ) -> Result<bool, AppError> {
     let url = stream_mgr.get_stream_url(&file_id);
-    let file = db.get_file(&file_id)?;
-    let title = file.as_ref().map(|f| f.name.as_str()).unwrap_or("Video");
+    let db = Arc::clone(&*db);
+    let f_id = file_id.clone();
+    let file = tauri::async_runtime::spawn_blocking(move || db.get_file(&f_id))
+        .await
+        .map_err(|e| AppError::Io(format!("Task spawn failed: {e}")))?
+        ?;
+    let title = file.as_ref().map(|f| f.name.clone()).unwrap_or_else(|| "Video".into());
     let mime = file
         .as_ref()
-        .map(|f| f.mime_type.as_str())
-        .unwrap_or("video/*");
-    crate::android_bridge::open_in_external_player(&url, mime, title);
+        .map(|f| f.mime_type.clone())
+        .unwrap_or_else(|| "video/*".into());
+    crate::android_bridge::open_in_external_player(&url, &mime, &title);
     Ok(true)
 }
+
+#[tauri::command]
+pub fn get_debug_logs() -> Result<String, AppError> {
+    Ok(crate::android_bridge::get_recent_logs())
+}
+
+#[tauri::command]
+pub fn get_debug_log_path() -> Result<String, AppError> {
+    Ok(crate::android_bridge::get_log_file_path())
+}
+
 
 

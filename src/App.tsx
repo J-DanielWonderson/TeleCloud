@@ -7,6 +7,8 @@ import { FeedbackModal } from './components/FeedbackModal';
 import { FileExplorer } from './components/FileExplorer';
 import { TransferDrawer } from './components/TransferDrawer';
 import { IntroSplash } from './components/IntroSplash';
+import { UpdateModal } from './components/UpdateModal';
+import { checkForUpdate, UpdateCheckResult } from './services/updateService';
 import { useVFSStore } from './store/vfsStore';
 import { SetupStatus, TelegramUserProfile } from './types/vfs';
 
@@ -16,6 +18,7 @@ export const App: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(true);
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
   const [feedbackOpen, setFeedbackOpen] = useState<boolean>(false);
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateCheckResult | null>(null);
   const [showIntro, setShowIntro] = useState<boolean>(() => {
     return !sessionStorage.getItem('telegram_drive_intro_shown');
   });
@@ -72,10 +75,15 @@ export const App: React.FC = () => {
     fetchStatus(true);
 
     // Initialize Tauri transfer progress listener
+    let disposed = false;
     let unlistenFn: (() => void) | undefined;
     initEventListener()
       .then((unlisten) => {
-        unlistenFn = unlisten;
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenFn = unlisten;
+        }
       })
       .catch((err) => {
         console.error('Failed to initialize transfer progress listener:', err);
@@ -87,18 +95,52 @@ export const App: React.FC = () => {
       console.log('Real-time sync: VFS index updated, refreshing directory view...');
       useVFSStore.getState().loadDirectory();
     }).then((unlisten) => {
-      unlistenVfs = unlisten;
+      if (disposed) {
+        unlisten();
+      } else {
+        unlistenVfs = unlisten;
+      }
     }).catch((e) => console.warn('vfs-changed listener registration notice:', e));
 
+    // Non-blocking auto update check on launch (honors user preferences)
+    let updateTimer: ReturnType<typeof setTimeout> | undefined;
+    const autoUpdateEnabled = localStorage.getItem('telecloud_auto_update_check') !== 'false';
+    if (autoUpdateEnabled) {
+      updateTimer = setTimeout(() => {
+        handleCheckUpdates(false);
+      }, 3500);
+    }
+
     return () => {
+      disposed = true;
       if (unlistenFn) {
         unlistenFn();
       }
       if (unlistenVfs) {
         unlistenVfs();
       }
+      if (updateTimer) {
+        clearTimeout(updateTimer);
+      }
     };
   }, []);
+
+  const handleCheckUpdates = async (manual = true) => {
+    try {
+      const res = await checkForUpdate('1.2.3');
+      if (res.updateAvailable) {
+        setAvailableUpdate(res);
+      } else if (manual) {
+        alert('You are already running the latest version of TeleCloud (v1.2.3)!');
+      }
+    } catch (err: unknown) {
+      console.error('Update check failed:', err);
+      if (manual) {
+        const msg = err instanceof Error ? err.message : String(err);
+        alert(`Could not check for updates: ${msg}`);
+      }
+    }
+  };
 
   const handleWipeVault = async () => {
     if (confirm('Are you sure you want to wipe credentials and reset setup?')) {
@@ -153,6 +195,7 @@ export const App: React.FC = () => {
         onOpenFeedback={() => setFeedbackOpen(true)}
         onWipeVault={handleWipeVault}
         onRefreshStatus={() => fetchStatus(false)}
+        onCheckUpdates={() => handleCheckUpdates(true)}
       />
 
       {/* Floating Transfer Drawer */}
@@ -167,6 +210,7 @@ export const App: React.FC = () => {
           setFeedbackOpen(true);
         }}
         onBotsUpdated={() => fetchStatus(false)}
+        onCheckUpdates={() => handleCheckUpdates(true)}
       />
 
       {/* Feedback & Bug Report Modal */}
@@ -174,6 +218,14 @@ export const App: React.FC = () => {
         isOpen={feedbackOpen}
         onClose={() => setFeedbackOpen(false)}
       />
+
+      {/* User-Permitted Auto-Update Modal */}
+      {availableUpdate && (
+        <UpdateModal
+          updateInfo={availableUpdate}
+          onClose={() => setAvailableUpdate(null)}
+        />
+      )}
     </div>
   );
 };

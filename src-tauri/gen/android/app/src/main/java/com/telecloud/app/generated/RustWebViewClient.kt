@@ -99,5 +99,14 @@ class RustWebViewClient(webView: RustWebView, context: Context): WebViewClient()
         }
     }
 
-    
+    override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+        val didCrash = detail?.didCrash() ?: false
+        android.util.Log.e("TeleCloudApp", "onRenderProcessGone intercepted! didCrash=$didCrash")
+        try {
+            MainActivity.logToFile("WEBVIEW_CRASH", "Render process gone! didCrash=$didCrash")
+        } catch (_: Throwable) {}
+        // Returning true informs the system that the host application handles this situation
+        // and prevents Android from killing the entire app process.
+        return true
+    }
 }

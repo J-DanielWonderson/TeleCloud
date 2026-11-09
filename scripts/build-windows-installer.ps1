@@ -82,7 +82,9 @@ if (-not (Test-Path $OutputReleaseDir)) {
     New-Item -ItemType Directory -Force -Path $OutputReleaseDir | Out-Null
 }
 
-$FinalSetupExe = "$OutputReleaseDir\TeleCloud-1.1.3-Setup.exe"
+$pkgJson = Get-Content (Join-Path $RootDir "package.json") -Raw | ConvertFrom-Json
+$appVer = $pkgJson.version
+$FinalSetupExe = "$OutputReleaseDir\TeleCloud-$appVer-Setup.exe"
 Copy-Item "$RootDir\installer\src-tauri\target\release\TeleCloud-Setup.exe" $FinalSetupExe -Force
 Copy-Item $MainExe "$OutputReleaseDir\TeleCloud.exe" -Force
 

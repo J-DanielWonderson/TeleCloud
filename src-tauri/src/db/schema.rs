@@ -100,13 +100,62 @@ impl DbManager {
         let conn = Connection::open(&db_path)
             .map_err(|e| AppError::Database(format!("Failed to open SQLite database: {e}")))?;
 
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
-            db_path,
+            db_path: db_path.clone(),
         };
 
+        if let Err(e) = db.init_schema() {
+            let msg = format!("Failed to initialize SQLite schema on {}: {e}. Attempting recovery...", db_path.display());
+            eprintln!("[DATABASE] {msg}");
+            crate::android_bridge::log_to_file("DATABASE", &msg);
+            drop(db);
+            let ts = chrono::Utc::now().timestamp();
+            let corrupt_path = db_path.with_file_name(format!("{}.corrupt-{}", DB_FILE_NAME, ts));
+            let _ = fs::rename(&db_path, &corrupt_path);
+            let new_conn = Connection::open(&db_path)
+                .map_err(|err| AppError::Database(format!("Failed to recreate SQLite database: {err}")))?;
+            let _ = new_conn.busy_timeout(std::time::Duration::from_secs(10));
+            let new_db = Self {
+                conn: Arc::new(Mutex::new(new_conn)),
+                db_path,
+            };
+            new_db.init_schema()?;
+            return Ok(new_db);
+        }
+
+        Ok(db)
+    }
+
+    /// Creates an in-memory SQLite database instance with schema initialized
+    pub fn open_in_memory() -> Result<Self, AppError> {
+        let conn = Connection::open_in_memory()
+            .map_err(|e| AppError::Database(format!("Failed to open in-memory SQLite: {e}")))?;
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+        let db = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            db_path: PathBuf::from(":memory:"),
+        };
         db.init_schema()?;
         Ok(db)
+    }
+
+    /// Safe fallback database manager that guarantees a usable SQLite database
+    pub fn fallback() -> Self {
+        if let Ok(db) = Self::open_in_memory() {
+            return db;
+        }
+        let fallback_path = std::env::temp_dir().join(format!("telecloud_fallback_{}.db", chrono::Utc::now().timestamp()));
+        if let Ok(db) = Self::open(fallback_path) {
+            return db;
+        }
+        let conn = Connection::open_in_memory().unwrap_or_else(|_| Connection::open(":memory:").unwrap());
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            db_path: PathBuf::from(":memory:"),
+        }
     }
 
     /// Initializes schema with strict PRAGMAs, tables, and indexes
@@ -398,6 +447,166 @@ impl DbManager {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    pub fn get_folder(&self, id: &str) -> Result<Option<FolderRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, name, color, created_at, updated_at, is_trashed FROM folders WHERE id = ?1",
+        )?;
+        let res = stmt
+            .query_row(params![id], |row| {
+                Ok(FolderRecord {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    name: row.get(2)?,
+                    color: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    is_trashed: row.get(6)?,
+                })
+            })
+            .optional()?;
+        Ok(res)
+    }
+
+    /// Duplicate a file and all its MTProto chunks into target_folder_id (instant cloud copy)
+    pub fn copy_file(&self, file_id: &str, target_folder_id: Option<&str>) -> Result<FileRecord, AppError> {
+        let original = self.get_file(file_id)?.ok_or_else(|| AppError::FileNotFound(file_id.to_string()))?;
+        let chunks = self.get_chunks_for_file(file_id)?;
+
+        let mut target_name = original.name.clone();
+        let existing_files = self.list_files(target_folder_id, false)?;
+        let name_exists = existing_files.iter().any(|f| f.name.eq_ignore_ascii_case(&target_name));
+
+        if name_exists || original.folder_id.as_deref() == target_folder_id {
+            let (stem, ext) = match original.name.rfind('.') {
+                Some(dot_idx) if dot_idx > 0 => (&original.name[..dot_idx], &original.name[dot_idx..]),
+                _ => (original.name.as_str(), ""),
+            };
+            let mut counter = 1;
+            loop {
+                let candidate = if counter == 1 {
+                    format!("{} - Copy{}", stem, ext)
+                } else {
+                    format!("{} - Copy ({}){}", stem, counter, ext)
+                };
+                if !existing_files.iter().any(|f| f.name.eq_ignore_ascii_case(&candidate)) {
+                    target_name = candidate;
+                    break;
+                }
+                counter += 1;
+            }
+        }
+
+        let new_file_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let new_file = FileRecord {
+            id: new_file_id.clone(),
+            folder_id: target_folder_id.map(|s| s.to_string()),
+            name: target_name,
+            total_size_bytes: original.total_size_bytes,
+            mime_type: original.mime_type,
+            full_sha256: original.full_sha256,
+            total_chunks: original.total_chunks,
+            status: original.status,
+            created_at: now,
+            updated_at: now,
+            is_trashed: 0,
+        };
+
+        self.create_file(&new_file)?;
+
+        if !chunks.is_empty() {
+            let mut new_chunks = Vec::with_capacity(chunks.len());
+            for c in chunks {
+                new_chunks.push(FileChunkRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    file_id: new_file_id.clone(),
+                    chunk_index: c.chunk_index,
+                    byte_offset: c.byte_offset,
+                    byte_length: c.byte_length,
+                    telegram_message_id: c.telegram_message_id,
+                    chunk_sha256: c.chunk_sha256,
+                    upload_status: c.upload_status,
+                });
+            }
+            self.insert_chunks_batch(&new_chunks)?;
+        }
+
+        Ok(new_file)
+    }
+
+    /// Recursively duplicate a folder, its nested subfolders, and all contained files
+    pub fn copy_folder(&self, folder_id: &str, target_parent_id: Option<&str>) -> Result<FolderRecord, AppError> {
+        let original = self.get_folder(folder_id)?.ok_or_else(|| AppError::FolderNotFound(folder_id.to_string()))?;
+
+        // Guard against cycles: cannot copy folder into itself or any descendant
+        if let Some(target_id) = target_parent_id {
+            if target_id == folder_id {
+                return Err(AppError::Validation("Cannot copy folder into itself".into()));
+            }
+            let conn = self.conn.lock().unwrap();
+            let mut curr = Some(target_id.to_string());
+            while let Some(pid) = curr {
+                if pid == folder_id {
+                    return Err(AppError::Validation("Cannot copy folder into its own sub-folder".into()));
+                }
+                let mut stmt = conn.prepare("SELECT parent_id FROM folders WHERE id = ?1")?;
+                let res = stmt.query_row(params![pid], |row| row.get::<_, Option<String>>(0));
+                match res {
+                    Ok(next_pid) => curr = next_pid,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let mut target_name = original.name.clone();
+        let existing_folders = self.list_folders(target_parent_id, false)?;
+        let name_exists = existing_folders.iter().any(|f| f.name.eq_ignore_ascii_case(&target_name));
+
+        if name_exists || original.parent_id.as_deref() == target_parent_id {
+            let mut counter = 1;
+            loop {
+                let candidate = if counter == 1 {
+                    format!("{} - Copy", original.name)
+                } else {
+                    format!("{} - Copy ({})", original.name, counter)
+                };
+                if !existing_folders.iter().any(|f| f.name.eq_ignore_ascii_case(&candidate)) {
+                    target_name = candidate;
+                    break;
+                }
+                counter += 1;
+            }
+        }
+
+        let new_folder_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let new_folder = FolderRecord {
+            id: new_folder_id,
+            parent_id: target_parent_id.map(|s| s.to_string()),
+            name: target_name,
+            color: original.color.clone(),
+            created_at: now,
+            updated_at: now,
+            is_trashed: 0,
+        };
+        self.create_folder(&new_folder)?;
+
+        // Recursively duplicate files in folder
+        let files = self.list_files(Some(folder_id), false)?;
+        for f in files {
+            self.copy_file(&f.id, Some(&new_folder.id))?;
+        }
+
+        // Recursively duplicate child subfolders
+        let subfolders = self.list_folders(Some(folder_id), false)?;
+        for sf in subfolders {
+            self.copy_folder(&sf.id, Some(&new_folder.id))?;
+        }
+
+        Ok(new_folder)
     }
 
     // -------------------------------------------------------------------------

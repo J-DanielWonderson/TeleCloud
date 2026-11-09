@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::{Read, Write},
-    path::PathBuf,
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 use tauri::{AppHandle, Manager};
@@ -16,6 +16,7 @@ use tauri::{AppHandle, Manager};
 use crate::error::AppError;
 
 const VAULT_FILE_NAME: &str = "telecloud.vault.enc";
+const KEY_FILE_NAME: &str = "telecloud.key";
 const VAULT_SALT: &[u8] = b"TeleCloud-Vault-Secure-Master-Entropy-Salt-2026";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,7 @@ pub struct VaultCredentials {
 
 #[derive(Clone)]
 pub struct Keystore {
+    app_dir: PathBuf,
     vault_path: PathBuf,
     derived_key: [u8; 32],
     cache: Arc<RwLock<Option<VaultCredentials>>>,
@@ -50,38 +52,115 @@ impl Keystore {
         Self::from_path(app_dir)
     }
 
+    /// Safe fallback keystore that allows the app to operate cleanly in unconfigured state
+    pub fn fallback() -> Self {
+        let temp = std::env::temp_dir().join("telecloud_vault_fallback");
+        let _ = fs::create_dir_all(&temp);
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        Self {
+            app_dir: temp.clone(),
+            vault_path: temp.join(VAULT_FILE_NAME),
+            derived_key: key,
+            cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
     pub fn from_path(app_dir: PathBuf) -> Result<Self, AppError> {
         let vault_dir = app_dir.join("vault");
         if !vault_dir.exists() {
-            fs::create_dir_all(&vault_dir).map_err(|e| {
-                AppError::Keystore(format!("Failed to create vault directory: {e}"))
-            })?;
+            if let Err(e) = fs::create_dir_all(&vault_dir) {
+                let msg = format!("Failed to create vault directory at {}: {e}", vault_dir.display());
+                crate::android_bridge::log_to_file("KEYSTORE", &msg);
+                return Err(AppError::Keystore(msg));
+            }
         }
 
         let vault_path = vault_dir.join(VAULT_FILE_NAME);
-        let derived_key = Self::derive_machine_key(&app_dir)?;
+        let derived_key = Self::get_or_create_vault_key(&vault_dir, &app_dir);
 
         let keystore = Self {
+            app_dir,
             vault_path,
             derived_key,
             cache: Arc::new(RwLock::new(None)),
         };
 
-        // If file exists, pre-load and cache credentials
+        // If file exists, pre-load and cache credentials.
+        // If decryption/parsing fails, load_credentials renames the corrupt file and returns Ok(None).
         if keystore.vault_path.exists() {
-            let _ = keystore.load_credentials()?;
+            let _ = keystore.load_credentials();
         }
 
         Ok(keystore)
     }
 
-    /// Derives an AES-256 machine-bound encryption key
-    fn derive_machine_key(app_dir: &PathBuf) -> Result<[u8; 32], AppError> {
+    /// Resolves the random 32-byte key file in the vault directory.
+    /// If missing, checks for an existing legacy vault to decrypt with environment derivation and migrate.
+    /// Otherwise, generates a fresh random 32-byte key file.
+    fn get_or_create_vault_key(vault_dir: &Path, app_dir: &Path) -> [u8; 32] {
+        let key_path = vault_dir.join(KEY_FILE_NAME);
+        if key_path.exists() {
+            if let Ok(data) = fs::read(&key_path) {
+                if data.len() >= 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&data[..32]);
+                    return key;
+                }
+            }
+        }
+
+        let vault_path = vault_dir.join(VAULT_FILE_NAME);
+        let legacy_key = Self::derive_legacy_machine_key(app_dir);
+
+        // If legacy vault exists without a key file, attempt migration using the legacy env derivation
+        if vault_path.exists() {
+            if let Ok(payload) = fs::read(&vault_path) {
+                if let Ok(creds) = Self::decrypt_payload_raw(&payload, &legacy_key) {
+                    let mut new_key = [0u8; 32];
+                    rand::thread_rng().fill_bytes(&mut new_key);
+                    if fs::write(&key_path, &new_key).is_ok() {
+                        if let Ok(new_payload) = Self::encrypt_payload_raw(&creds, &new_key) {
+                            let _ = fs::write(&vault_path, &new_payload);
+                            let msg = "Migrated existing vault from legacy env-derived key to new 32-byte key file.";
+                            eprintln!("[KEYSTORE] {msg}");
+                            crate::android_bridge::log_to_file("KEYSTORE", msg);
+                            return new_key;
+                        }
+                    }
+                } else {
+                    // Legacy vault decryption failed during key migration; rename corrupt file
+                    let ts = chrono::Utc::now().timestamp();
+                    let corrupt_name = format!("{}.corrupt-{}", VAULT_FILE_NAME, ts);
+                    let corrupt_path = vault_dir.join(&corrupt_name);
+                    let _ = fs::rename(&vault_path, &corrupt_path);
+                    let msg = format!(
+                        "Existing vault could not be decrypted during key migration. Renamed to {}. Continuing as not configured.",
+                        corrupt_path.display()
+                    );
+                    eprintln!("[KEYSTORE] {msg}");
+                    crate::android_bridge::log_to_file("KEYSTORE", &msg);
+                }
+            }
+        }
+
+        // Clean install or after corrupt rename: generate fresh random 32-byte key
+        let mut new_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut new_key);
+        if let Err(e) = fs::write(&key_path, &new_key) {
+            let msg = format!("Warning: failed to persist key file at {}: {e}", key_path.display());
+            eprintln!("[KEYSTORE] {msg}");
+            crate::android_bridge::log_to_file("KEYSTORE", &msg);
+        }
+        new_key
+    }
+
+    /// Legacy env-var based key derivation (USER/USERNAME/COMPUTERNAME) kept strictly as fallback
+    fn derive_legacy_machine_key(app_dir: &Path) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(VAULT_SALT);
         hasher.update(app_dir.to_string_lossy().as_bytes());
 
-        // Machine-specific entropy (hostname / user identity)
         if let Ok(user) = std::env::var("USERNAME").or_else(|_| std::env::var("USER")) {
             hasher.update(user.as_bytes());
         }
@@ -96,45 +175,16 @@ impl Keystore {
         let result = hasher.finalize();
         let mut key = [0u8; 32];
         key.copy_from_slice(&result[..32]);
-        Ok(key)
+        key
     }
 
-    /// Check if vault credentials have been set up and exist
-    pub fn is_configured(&self) -> bool {
-        let guard = self.cache.read().unwrap();
-        if guard.is_some() {
-            return true;
-        }
-        drop(guard);
-        self.vault_path.exists()
-    }
-
-    /// Load and decrypt credentials from the vault file
-    pub fn load_credentials(&self) -> Result<Option<VaultCredentials>, AppError> {
-        {
-            let guard = self.cache.read().unwrap();
-            if let Some(ref creds) = *guard {
-                return Ok(Some(creds.clone()));
-            }
+    fn decrypt_payload_raw(payload: &[u8], key: &[u8; 32]) -> Result<VaultCredentials, AppError> {
+        if payload.len() < 12 {
+            return Err(AppError::Keystore("Encrypted payload too short".into()));
         }
 
-        if !self.vault_path.exists() {
-            return Ok(None);
-        }
-
-        let mut file = File::open(&self.vault_path)
-            .map_err(|e| AppError::Keystore(format!("Failed to open vault file: {e}")))?;
-
-        let mut encrypted_payload = Vec::new();
-        file.read_to_end(&mut encrypted_payload)
-            .map_err(|e| AppError::Keystore(format!("Failed to read vault file: {e}")))?;
-
-        if encrypted_payload.len() < 12 {
-            return Err(AppError::Keystore("Encrypted vault file is corrupted".into()));
-        }
-
-        let (nonce_bytes, ciphertext) = encrypted_payload.split_at(12);
-        let cipher = Aes256Gcm::new_from_slice(&self.derived_key)
+        let (nonce_bytes, ciphertext) = payload.split_at(12);
+        let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|e| AppError::Keystore(format!("AES initialization error: {e}")))?;
         let nonce = Nonce::from_slice(nonce_bytes);
 
@@ -145,18 +195,14 @@ impl Keystore {
         let creds: VaultCredentials = serde_json::from_slice(&plaintext)
             .map_err(|e| AppError::Keystore(format!("Failed to parse decrypted credentials: {e}")))?;
 
-        let mut guard = self.cache.write().unwrap();
-        *guard = Some(creds.clone());
-
-        Ok(Some(creds))
+        Ok(creds)
     }
 
-    /// Encrypt and persist credentials
-    pub fn save_credentials(&self, creds: &VaultCredentials) -> Result<(), AppError> {
+    fn encrypt_payload_raw(creds: &VaultCredentials, key: &[u8; 32]) -> Result<Vec<u8>, AppError> {
         let plaintext = serde_json::to_vec(creds)
             .map_err(|e| AppError::Keystore(format!("Failed to serialize credentials: {e}")))?;
 
-        let cipher = Aes256Gcm::new_from_slice(&self.derived_key)
+        let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|e| AppError::Keystore(format!("AES initialization error: {e}")))?;
 
         let mut nonce_bytes = [0u8; 12];
@@ -170,6 +216,93 @@ impl Keystore {
         let mut payload = Vec::with_capacity(12 + ciphertext.len());
         payload.extend_from_slice(&nonce_bytes);
         payload.extend_from_slice(&ciphertext);
+        Ok(payload)
+    }
+
+    fn handle_corrupted_vault(&self, reason: &str) {
+        let ts = chrono::Utc::now().timestamp();
+        let corrupt_name = format!("{}.corrupt-{}", VAULT_FILE_NAME, ts);
+        let corrupt_path = self.vault_path.with_file_name(&corrupt_name);
+        let _ = fs::rename(&self.vault_path, &corrupt_path);
+        let msg = format!(
+            "Vault corruption detected ({reason}). Renamed to {}. Continuing as not configured.",
+            corrupt_path.display()
+        );
+        eprintln!("[KEYSTORE] {msg}");
+        crate::android_bridge::log_to_file("KEYSTORE", &msg);
+        let mut guard = self.cache.write().unwrap_or_else(|p| p.into_inner());
+        *guard = None;
+    }
+
+    /// Check if vault credentials have been set up and exist
+    pub fn is_configured(&self) -> bool {
+        let guard = self.cache.read().unwrap_or_else(|p| p.into_inner());
+        if guard.is_some() {
+            return true;
+        }
+        drop(guard);
+        self.vault_path.exists()
+    }
+
+    /// Load and decrypt credentials from the vault file.
+    /// If decryption or parsing fails, renames the corrupt file and continues as unconfigured.
+    pub fn load_credentials(&self) -> Result<Option<VaultCredentials>, AppError> {
+        {
+            let guard = self.cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(ref creds) = *guard {
+                return Ok(Some(creds.clone()));
+            }
+        }
+
+        if !self.vault_path.exists() {
+            return Ok(None);
+        }
+
+        let encrypted_payload = match fs::read(&self.vault_path) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("Failed to read vault file: {e}");
+                crate::android_bridge::log_to_file("KEYSTORE", &msg);
+                return Err(AppError::Keystore(msg));
+            }
+        };
+
+        if encrypted_payload.len() < 12 {
+            self.handle_corrupted_vault("payload size < 12 bytes");
+            return Ok(None);
+        }
+
+        // Try decrypting with current 32-byte key
+        let creds = match Self::decrypt_payload_raw(&encrypted_payload, &self.derived_key) {
+            Ok(c) => c,
+            Err(primary_err) => {
+                // Fallback attempt: decrypt using legacy machine key
+                let legacy_key = Self::derive_legacy_machine_key(&self.app_dir);
+                match Self::decrypt_payload_raw(&encrypted_payload, &legacy_key) {
+                    Ok(c) => {
+                        let msg = "Vault decrypted with legacy key fallback. Migrating to primary key...";
+                        eprintln!("[KEYSTORE] {msg}");
+                        crate::android_bridge::log_to_file("KEYSTORE", msg);
+                        let _ = self.save_credentials(&c);
+                        c
+                    }
+                    Err(_) => {
+                        self.handle_corrupted_vault(&format!("decrypt failed: {primary_err}"));
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+
+        let mut guard = self.cache.write().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(creds.clone());
+
+        Ok(Some(creds))
+    }
+
+    /// Encrypt and persist credentials
+    pub fn save_credentials(&self, creds: &VaultCredentials) -> Result<(), AppError> {
+        let payload = Self::encrypt_payload_raw(creds, &self.derived_key)?;
 
         let temp_path = self.vault_path.with_extension("tmp");
         {
@@ -184,7 +317,7 @@ impl Keystore {
         fs::rename(&temp_path, &self.vault_path)
             .map_err(|e| AppError::Keystore(format!("Failed to commit vault file: {e}")))?;
 
-        let mut guard = self.cache.write().unwrap();
+        let mut guard = self.cache.write().unwrap_or_else(|p| p.into_inner());
         *guard = Some(creds.clone());
 
         Ok(())
@@ -250,12 +383,16 @@ impl Keystore {
             fs::remove_file(&self.vault_path)
                 .map_err(|e| AppError::Keystore(format!("Failed to delete vault file: {e}")))?;
         }
-        let mut guard = self.cache.write().unwrap();
+        let key_path = self.vault_path.with_file_name(KEY_FILE_NAME);
+        if key_path.exists() {
+            let _ = fs::remove_file(key_path);
+        }
+        let mut guard = self.cache.write().unwrap_or_else(|p| p.into_inner());
         *guard = None;
         Ok(())
     }
 
-    /// Encrypt an arbitrary string value (e.g. worker bot token) with AES-256-GCM
+    /// Encrypt an arbitrary string value with AES-256-GCM
     pub fn encrypt_value(&self, value: &str) -> Result<String, AppError> {
         let cipher = Aes256Gcm::new_from_slice(&self.derived_key)
             .map_err(|e| AppError::Keystore(format!("AES initialization error: {e}")))?;
@@ -275,7 +412,7 @@ impl Keystore {
         Ok(hex::encode(payload))
     }
 
-    /// Decrypt an arbitrary AES-256-GCM hex string value
+    /// Decrypt an arbitrary AES-256-GCM hex string value (with legacy fallback)
     pub fn decrypt_value(&self, encrypted_hex: &str) -> Result<String, AppError> {
         let payload = hex::decode(encrypted_hex)
             .map_err(|e| AppError::Keystore(format!("Hex decode error: {e}")))?;
@@ -290,9 +427,17 @@ impl Keystore {
         let cipher = Aes256Gcm::new_from_slice(&self.derived_key)
             .map_err(|e| AppError::Keystore(format!("AES initialization error: {e}")))?;
 
-        let plaintext = cipher
-            .decrypt(nonce, Payload { msg: ciphertext, aad: VAULT_SALT })
-            .map_err(|e| AppError::Keystore(format!("AES decryption error: {e}")))?;
+        let plaintext = match cipher.decrypt(nonce, Payload { msg: ciphertext, aad: VAULT_SALT }) {
+            Ok(pt) => pt,
+            Err(_) => {
+                let legacy_key = Self::derive_legacy_machine_key(&self.app_dir);
+                let legacy_cipher = Aes256Gcm::new_from_slice(&legacy_key)
+                    .map_err(|e| AppError::Keystore(format!("AES initialization error: {e}")))?;
+                legacy_cipher
+                    .decrypt(nonce, Payload { msg: ciphertext, aad: VAULT_SALT })
+                    .map_err(|e| AppError::Keystore(format!("AES decryption error: {e}")))?
+            }
+        };
 
         String::from_utf8(plaintext)
             .map_err(|e| AppError::Keystore(format!("UTF-8 decode error: {e}")))

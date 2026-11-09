@@ -137,13 +137,30 @@ dependencies {
     Write-Host "Generated app/tauri.build.gradle.kts" -ForegroundColor Yellow
 }
 
+$pkgJson = Get-Content (Join-Path $RootDir "package.json") -Raw | ConvertFrom-Json
+$appVer = $pkgJson.version
+$verParts = $appVer.Split('.')
+$vMaj = [int]$verParts[0]
+$vMin = if ($verParts.Length -gt 1) { [int]$verParts[1] } else { 0 }
+$vPatch = if ($verParts.Length -gt 2) { [int]$verParts[2] } else { 0 }
+$computedCode = ($vMaj * 1000000) + ($vMin * 1000) + $vPatch
+
 $TauriProperties = Join-Path $RootDir "src-tauri/gen/android/app/tauri.properties"
 $tauriPropsContent = @"
-tauri.android.versionName=1.1.3
-tauri.android.versionCode=1001003
+tauri.android.versionName=$appVer
+tauri.android.versionCode=$computedCode
 "@
 Set-Content -Path $TauriProperties -Value $tauriPropsContent -Encoding UTF8
-Write-Host "Updated app/tauri.properties (v1.1.3)" -ForegroundColor Yellow
+Write-Host "Updated app/tauri.properties (v$appVer, code $computedCode)" -ForegroundColor Yellow
+
+# Ensure telecloud.keystore exists in both gen/android and gen/android/app directories
+$sourceKeystore = Join-Path $RootDir "src-tauri/gen/android/telecloud.keystore"
+$targetKeystore = Join-Path $RootDir "src-tauri/gen/android/app/telecloud.keystore"
+if ((Test-Path $sourceKeystore) -and -not (Test-Path $targetKeystore)) {
+    Copy-Item $sourceKeystore $targetKeystore -Force
+} elseif ((Test-Path $targetKeystore) -and -not (Test-Path $sourceKeystore)) {
+    Copy-Item $targetKeystore $sourceKeystore -Force
+}
 
 # Ensure tauri.settings.gradle exists with absolute paths for the current machine
 $TauriSettingsPath = Join-Path $GradleDir "tauri.settings.gradle"
@@ -198,7 +215,7 @@ if (-not (Test-Path $ApkSource)) {
     }
 }
 
-$FinalApk = Join-Path $ReleaseDir "TeleCloud-1.1.3-arm64.apk"
+$FinalApk = Join-Path $ReleaseDir "TeleCloud-$appVer-arm64.apk"
 Copy-Item $ApkSource $FinalApk -Force
 Write-Host "Output APK: $FinalApk ($((Get-Item $FinalApk).Length / 1MB | ForEach-Object { '{0:N2} MB' -f $_ }))" -ForegroundColor Green
 

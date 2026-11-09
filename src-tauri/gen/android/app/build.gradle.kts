@@ -26,9 +26,25 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
+    signingConfigs {
+        create("telecloud") {
+            val keyFile = rootProject.file("telecloud.keystore").takeIf { it.exists() }
+                ?: file("telecloud.keystore").takeIf { it.exists() }
+                ?: rootProject.file("app/telecloud.keystore").takeIf { it.exists() }
+                ?: file("../telecloud.keystore")
+            if (!keyFile.exists()) {
+                throw GradleException("TeleCloud signing keystore not found at ${keyFile.absolutePath}! Required to prevent Android package signature conflicts.")
+            }
+            storeFile = keyFile
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
     buildTypes {
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
+            signingConfig = signingConfigs.getByName("telecloud")
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
@@ -41,7 +57,7 @@ android {
         }
         getByName("release") {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("telecloud")
             isMinifyEnabled = false
             optimization {
                enable = true

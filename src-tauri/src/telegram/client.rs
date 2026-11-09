@@ -101,13 +101,33 @@ impl TelegramClientManager {
         })
     }
 
+    /// Safe fallback client manager that operates with fallback temporary session path
+    pub fn fallback(keystore: Arc<Keystore>, db: Arc<DbManager>) -> Self {
+        let session_dir = std::env::temp_dir().join("telecloud_session_fallback");
+        let _ = std::fs::create_dir_all(&session_dir);
+        Self {
+            keystore,
+            db,
+            session_path: session_dir.join("telecloud_master.session"),
+            client: Arc::new(RwLock::new(None)),
+            auth_state: Arc::new(Mutex::new(AuthState::Idle)),
+        }
+    }
+
     /// Connect or retrieve cached MTProto client
     pub async fn get_client(&self) -> Result<Client, AppError> {
+        // Fast path with read lock
         {
             let guard = self.client.read().await;
             if let Some(ref c) = *guard {
                 return Ok(c.clone());
             }
+        }
+
+        // Slow path: acquire exclusive write lock so initialization happens strictly once
+        let mut guard = self.client.write().await;
+        if let Some(ref c) = *guard {
+            return Ok(c.clone());
         }
 
         let creds = self
@@ -125,8 +145,6 @@ impl TelegramClientManager {
         tokio::spawn(pool.runner.run());
 
         let client = Client::new(handle);
-
-        let mut guard = self.client.write().await;
         *guard = Some(client.clone());
 
         Ok(client)
@@ -384,20 +402,7 @@ impl TelegramClientManager {
 
     /// Resolve the storage channel PeerRef for MTProto calls
     pub async fn resolve_storage_channel_peer_ref(&self) -> Result<PeerRef, AppError> {
-        let client = self.get_client().await?;
-
-        // 1. Try finding in dialogs
-        let mut dialogs = client.iter_dialogs();
-        while let Ok(Some(dialog)) = dialogs.next().await {
-            if dialog.peer().name() == Some(DEFAULT_STORAGE_CHANNEL_TITLE) {
-                let pr = dialog.peer_ref();
-                self.db.set_config("storage_channel_id", &pr.id.bare_id_unchecked().to_string())?;
-                self.db.set_config("storage_channel_access_hash", &pr.auth.hash().to_string())?;
-                return Ok(pr);
-            }
-        }
-
-        // 2. Use cached channel_id & access_hash
+        // 1. Instant check: Use cached channel_id & access_hash from local database (0ms, no network calls!)
         if let (Some(id_str), Some(hash_str)) = (
             self.db.get_config("storage_channel_id")?,
             self.db.get_config("storage_channel_access_hash")?,
@@ -409,7 +414,20 @@ impl TelegramClientManager {
             }
         }
 
-        // 3. Fallback: provision and return
+        let client = self.get_client().await?;
+
+        // 2. Fallback: Search in user dialogs over MTProto
+        let mut dialogs = client.iter_dialogs();
+        while let Ok(Some(dialog)) = dialogs.next().await {
+            if dialog.peer().name() == Some(DEFAULT_STORAGE_CHANNEL_TITLE) {
+                let pr = dialog.peer_ref();
+                self.db.set_config("storage_channel_id", &pr.id.bare_id_unchecked().to_string())?;
+                self.db.set_config("storage_channel_access_hash", &pr.auth.hash().to_string())?;
+                return Ok(pr);
+            }
+        }
+
+        // 3. Fallback: provision new storage channel and return
         let info = self.provision_storage_channel().await?;
         if let Some(hash_str) = self.db.get_config("storage_channel_access_hash")? {
             if let Ok(access_hash) = hash_str.parse::<i64>() {

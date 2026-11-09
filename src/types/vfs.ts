@@ -71,6 +71,17 @@ export interface FileRecord {
 
 export type FileItem = FileRecord;
 
+export interface ClipboardItem {
+  id: string;
+  isFolder: boolean;
+  name: string;
+}
+
+export interface ClipboardState {
+  items: ClipboardItem[];
+  operation: 'copy' | 'cut';
+}
+
 export interface Breadcrumb {
   id: string | null;
   name: string;

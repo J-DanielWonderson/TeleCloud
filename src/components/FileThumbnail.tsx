@@ -18,7 +18,9 @@ import {
   requestThumbnailGeneration,
   getCachedThumbnail,
   cacheThumbnail,
+  cancelThumbnailRequest,
 } from '../utils/thumbnailQueue';
+import { isAndroid } from '../hooks/useMobile';
 
 interface FileThumbnailProps {
   file: FileItem;
@@ -32,7 +34,8 @@ export const FileThumbnail: React.FC<FileThumbnailProps> = ({
   className = '',
 }) => {
   const category = getFileCategory(file.name, file.mime_type);
-  const isVisualMedia = category === 'image' || category === 'video' || category === 'pdf';
+  // Visual media formats eligible for thumbnail generation and display
+  const isVisualMedia = category === 'image' || category === 'video' || (!isAndroid() && category === 'pdf');
 
   const [thumbSrc, setThumbSrc] = useState<string | null>(() => getCachedThumbnail(file.id) || null);
   const [hasError, setHasError] = useState(false);
@@ -65,7 +68,13 @@ export const FileThumbnail: React.FC<FileThumbnailProps> = ({
         const streamUrl = await invoke<string>('get_preview_stream_url', { fileId: file.id });
         if (!isMounted) return;
 
-        const generated = await requestThumbnailGeneration(file.id, file.name, file.mime_type, streamUrl);
+        const generated = await requestThumbnailGeneration(
+          file.id,
+          file.name,
+          file.mime_type,
+          streamUrl,
+          file.total_size_bytes
+        );
         if (isMounted) {
           if (generated) {
             setThumbSrc(generated);
@@ -86,8 +95,9 @@ export const FileThumbnail: React.FC<FileThumbnailProps> = ({
 
     return () => {
       isMounted = false;
+      cancelThumbnailRequest(file.id);
     };
-  }, [file.id, file.name, file.mime_type, isVisualMedia]);
+  }, [file.id, file.name, file.mime_type, file.total_size_bytes, isVisualMedia]);
 
   // If not visual media or thumbnail failed, render standard category icon
   if (!isVisualMedia || (hasError && !thumbSrc)) {

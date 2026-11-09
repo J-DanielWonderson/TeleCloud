@@ -29,6 +29,8 @@ render.experimental.xml
 # Keystore files
 *.jks
 *.keystore
+!src-tauri/gen/android/telecloud.keystore
+!src-tauri/gen/android/app/telecloud.keystore
 
 # Google Services (e.g. APIs or Firebase)
 google-services.json

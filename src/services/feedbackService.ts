@@ -34,7 +34,7 @@ export interface FeedbackResponse {
 }
 
 const STORAGE_KEY_CUSTOM_RELAY = 'telecloud_feedback_relay_url';
-export const APP_VERSION = '1.1.3';
+export const APP_VERSION = '1.2.3';
 export const DEFAULT_FEEDBACK_RELAY_URL = 'https://telecloud-feedback-relay.telegramcloud.workers.dev/api/feedback';
 
 /**

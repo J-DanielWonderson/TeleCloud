@@ -57,6 +57,29 @@ class TransferForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Immediate minimal notification at the very top of onStartCommand to satisfy Android background promotion requirement
+        try {
+            val minimalNotification = NotificationCompat.Builder(this, MainActivity.CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_stat_transfer)
+                .setContentTitle("TeleCloud Vault")
+                .setContentText("Transfer service running")
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setOngoing(true)
+                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    SERVICE_NOTIF_ID,
+                    minimalNotification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(SERVICE_NOTIF_ID, minimalNotification)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing initial minimal foreground notification: ${e.message}", e)
+        }
+
         if (intent?.action == ACTION_STOP) {
             stopTransferService()
             return START_NOT_STICKY
@@ -118,6 +141,7 @@ class TransferForegroundService : Service() {
             MainActivity.refreshForegroundNotification()
         } catch (e: Exception) {
             Log.e(TAG, "Error starting foreground service: ${e.message}", e)
+            stopSelf()
         }
     }
 

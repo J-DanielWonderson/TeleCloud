@@ -2,6 +2,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { getFileCategory } from './fileTypes';
 import { invoke } from '@tauri-apps/api/core';
+import { isAndroid } from '../hooks/useMobile';
 
 // Configure worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -11,51 +12,117 @@ type ThumbnailTask = {
   fileName: string;
   mimeType: string;
   streamUrl: string;
+  fileSize?: number;
   resolve: (url: string | null) => void;
+  cancelled?: boolean;
 };
 
+// Cap memoryCache with LRU policy (~100 entries)
+const MAX_CACHE_ENTRIES = 100;
 const memoryCache = new Map<string, string>();
-const failedSet = new Set<string>();
+
+// Transient failure map with retry timestamp
+const failedMap = new Map<string, number>();
+
 const taskQueue: ThumbnailTask[] = [];
 let activeWorkers = 0;
-const MAX_CONCURRENT = 4;
+let isQueuePaused = false;
+
+// Concurrency 2 on Android, 4 on desktop
+const getMaxConcurrent = () => (isAndroid() ? 2 : 4);
+
+export function pauseThumbnailQueue() {
+  isQueuePaused = true;
+}
+
+export function resumeThumbnailQueue() {
+  isQueuePaused = false;
+  processQueue();
+}
 
 export function cacheThumbnail(fileId: string, dataUrl: string) {
+  if (memoryCache.has(fileId)) {
+    memoryCache.delete(fileId);
+  } else if (memoryCache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = memoryCache.keys().next().value;
+    if (oldest) memoryCache.delete(oldest);
+  }
   memoryCache.set(fileId, dataUrl);
+
   try {
     localStorage.setItem(`tc_th_${fileId}`, dataUrl);
   } catch (_e) {
-    // Quota reached or private mode, in-memory cache still works
+    // Quota reached or private mode
+  }
+}
+
+export function getCachedThumbnail(fileId: string): string | undefined {
+  const inMem = memoryCache.get(fileId);
+  if (inMem) {
+    // Refresh LRU order
+    memoryCache.delete(fileId);
+    memoryCache.set(fileId, inMem);
+    return inMem;
+  }
+  try {
+    const local = localStorage.getItem(`tc_th_${fileId}`);
+    if (local) {
+      cacheThumbnail(fileId, local);
+      return local;
+    }
+  } catch (_e) {}
+  return undefined;
+}
+
+export function cancelThumbnailRequest(fileId: string) {
+  const idx = taskQueue.findIndex((t) => t.fileId === fileId);
+  if (idx !== -1) {
+    const [task] = taskQueue.splice(idx, 1);
+    task.cancelled = true;
+    task.resolve(null);
   }
 }
 
 function processQueue() {
-  if (activeWorkers >= MAX_CONCURRENT || taskQueue.length === 0) return;
+  if (isQueuePaused || activeWorkers >= getMaxConcurrent() || taskQueue.length === 0) return;
 
   const task = taskQueue.shift();
   if (!task) return;
+
+  if (task.cancelled) {
+    task.resolve(null);
+    processQueue();
+    return;
+  }
 
   activeWorkers++;
 
   generateThumbnail(task)
     .then((result) => {
+      if (task.cancelled) {
+        task.resolve(null);
+        return;
+      }
       if (result) {
         cacheThumbnail(task.fileId, result);
-        // Persist to backend cache
+        // Persist to backend disk cache
         invoke('save_file_thumbnail', {
           fileId: task.fileId,
           base64Data: result,
         }).catch((err) => {
           console.debug('Failed to persist thumbnail to disk:', err);
         });
+        failedMap.delete(task.fileId);
       } else {
-        failedSet.add(task.fileId);
+        // Transient error: retry allowed after 30 seconds
+        failedMap.set(task.fileId, Date.now() + 30_000);
       }
       task.resolve(result);
     })
     .catch((err) => {
       console.debug(`Thumbnail error for ${task.fileName}:`, err);
-      failedSet.add(task.fileId);
+      // Transient error: retry allowed after 30 seconds
+      failedMap.set(task.fileId, Date.now() + 30_000);
       task.resolve(null);
     })
     .finally(() => {
@@ -67,15 +134,130 @@ function processQueue() {
 async function generateThumbnail(task: ThumbnailTask): Promise<string | null> {
   const category = getFileCategory(task.fileName, task.mimeType);
 
+  // Skip images larger than 50 MB to preserve WebView memory
+  if (task.fileSize && task.fileSize > 50 * 1024 * 1024) {
+    return null;
+  }
+
   if (category === 'image') {
     return generateImageThumbnail(task.streamUrl);
   } else if (category === 'video') {
     return generateVideoThumbnail(task.streamUrl);
   } else if (category === 'pdf') {
+    if (isAndroid()) return null;
     return generatePdfThumbnail(task.streamUrl);
   }
 
   return null;
+}
+
+let videoQueueTail: Promise<void> = Promise.resolve();
+
+function generateVideoThumbnail(url: string): Promise<string | null> {
+  // Chain through videoQueueTail so only 1 video thumbnail decodes at any given moment
+  const run = () =>
+    new Promise<string | null>((resolve) => {
+      let finished = false;
+      const video = document.createElement('video');
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = 'metadata';
+      video.crossOrigin = 'anonymous';
+
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+      const cleanup = () => {
+        if (finished) return;
+        finished = true;
+        if (timeoutId) clearTimeout(timeoutId);
+        try {
+          video.pause();
+          video.removeAttribute('src');
+          video.load();
+        } catch (_e) {}
+      };
+
+      timeoutId = setTimeout(() => {
+        cleanup();
+        resolve(null);
+      }, 5000);
+
+      const captureFrame = () => {
+        if (finished) return;
+        try {
+          if (!video.videoWidth || !video.videoHeight) {
+            cleanup();
+            resolve(null);
+            return;
+          }
+          const canvas = document.createElement('canvas');
+          const maxDim = 240;
+          let width = video.videoWidth;
+          let height = video.videoHeight;
+          if (width > height) {
+            if (width > maxDim) {
+              height = Math.round((height * maxDim) / width);
+              width = maxDim;
+            }
+          } else {
+            if (height > maxDim) {
+              width = Math.round((width * maxDim) / height);
+              height = maxDim;
+            }
+          }
+          canvas.width = Math.max(1, width);
+          canvas.height = Math.max(1, height);
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            cleanup();
+            resolve(null);
+            return;
+          }
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+          cleanup();
+          resolve(dataUrl);
+        } catch (_e) {
+          cleanup();
+          resolve(null);
+        }
+      };
+
+      video.onloadedmetadata = () => {
+        if (finished) return;
+        try {
+          if (video.duration && video.duration > 0.5) {
+            video.currentTime = 0.5;
+          } else {
+            video.currentTime = 0.05;
+          }
+        } catch (_e) {
+          cleanup();
+          resolve(null);
+        }
+      };
+
+      video.onseeked = () => {
+        captureFrame();
+      };
+
+      video.onloadeddata = () => {
+        if (!finished && video.readyState >= 2) {
+          captureFrame();
+        }
+      };
+
+      video.onerror = () => {
+        cleanup();
+        resolve(null);
+      };
+
+      video.src = url;
+    });
+
+  const next = videoQueueTail.then(run, run);
+  videoQueueTail = next.then(() => {}, () => {});
+  return next;
 }
 
 function generateImageThumbnail(url: string): Promise<string | null> {
@@ -119,116 +301,6 @@ function generateImageThumbnail(url: string): Promise<string | null> {
   });
 }
 
-function generateVideoThumbnail(url: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    const video = document.createElement('video');
-    video.crossOrigin = 'anonymous';
-    video.muted = true;
-    video.playsInline = true;
-    video.preload = 'auto';
-
-    // Must be in DOM for Android System WebView to initialize hardware video decoders
-    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:16px;height:16px;opacity:0.01;pointer-events:none;z-index:-999;';
-    if (typeof document !== 'undefined' && document.body) {
-      document.body.appendChild(video);
-    }
-
-    let timeoutId: any = null;
-    let resolved = false;
-
-    const cleanup = () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      video.pause();
-      video.removeAttribute('src');
-      video.load();
-      if (video.parentNode) {
-        video.parentNode.removeChild(video);
-      }
-    };
-
-    const tryCaptureFrame = () => {
-      if (resolved) return;
-      try {
-        if (!video.videoWidth || !video.videoHeight) return;
-        const canvas = document.createElement('canvas');
-        const maxDim = 240;
-        let width = video.videoWidth || 320;
-        let height = video.videoHeight || 240;
-
-        if (width > height) {
-          if (width > maxDim) {
-            height = Math.round((height * maxDim) / width);
-            width = maxDim;
-          }
-        } else {
-          if (height > maxDim) {
-            width = Math.round((width * maxDim) / height);
-            height = maxDim;
-          }
-        }
-
-        canvas.width = Math.max(1, width);
-        canvas.height = Math.max(1, height);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          resolved = true;
-          cleanup();
-          resolve(null);
-          return;
-        }
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-        resolved = true;
-        cleanup();
-        resolve(dataUrl);
-      } catch (_e) {
-        resolved = true;
-        cleanup();
-        resolve(null);
-      }
-    };
-
-    timeoutId = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        cleanup();
-        resolve(null);
-      }
-    }, 4500); // 4.5s fast timeout
-
-    video.onloadeddata = () => {
-      tryCaptureFrame();
-    };
-
-    video.oncanplay = () => {
-      tryCaptureFrame();
-    };
-
-    video.onloadedmetadata = () => {
-      // Seek slightly past 0 (0.1s) to guarantee valid video keyframe
-      const seekTime = Math.min(0.2, video.duration > 1 ? 0.1 : 0.0);
-      try {
-        video.currentTime = seekTime;
-        video.play().catch(() => {});
-      } catch (_e) {}
-    };
-
-    video.onseeked = () => {
-      tryCaptureFrame();
-    };
-
-    video.onerror = () => {
-      if (!resolved) {
-        resolved = true;
-        cleanup();
-        resolve(null);
-      }
-    };
-
-    video.src = url;
-  });
-}
-
 async function generatePdfThumbnail(url: string): Promise<string | null> {
   try {
     const loadingTask = pdfjsLib.getDocument({
@@ -264,13 +336,20 @@ export function requestThumbnailGeneration(
   fileId: string,
   fileName: string,
   mimeType: string,
-  streamUrl: string
+  streamUrl: string,
+  fileSize?: number
 ): Promise<string | null> {
   if (memoryCache.has(fileId)) {
-    return Promise.resolve(memoryCache.get(fileId)!);
+    return Promise.resolve(getCachedThumbnail(fileId)!);
   }
-  if (failedSet.has(fileId)) {
-    return Promise.resolve(null);
+
+  // Check transient error timestamp
+  const retryAt = failedMap.get(fileId);
+  if (retryAt) {
+    if (Date.now() < retryAt) {
+      return Promise.resolve(null);
+    }
+    failedMap.delete(fileId);
   }
 
   return new Promise((resolve) => {
@@ -279,21 +358,9 @@ export function requestThumbnailGeneration(
       fileName,
       mimeType,
       streamUrl,
+      fileSize,
       resolve,
     });
     processQueue();
   });
-}
-
-export function getCachedThumbnail(fileId: string): string | undefined {
-  const inMem = memoryCache.get(fileId);
-  if (inMem) return inMem;
-  try {
-    const local = localStorage.getItem(`tc_th_${fileId}`);
-    if (local) {
-      memoryCache.set(fileId, local);
-      return local;
-    }
-  } catch (_e) {}
-  return undefined;
 }

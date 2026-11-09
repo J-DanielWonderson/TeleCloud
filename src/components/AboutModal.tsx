@@ -11,14 +11,16 @@ import {
   Layers,
   CheckCircle2,
   Code2,
+  Sparkles,
 } from 'lucide-react';
 
 interface AboutModalProps {
   isOpen: boolean;
   onClose: () => void;
+  onCheckUpdates?: () => void;
 }
 
-export const AboutModal: React.FC<AboutModalProps> = ({ isOpen, onClose }) => {
+export const AboutModal: React.FC<AboutModalProps> = ({ isOpen, onClose, onCheckUpdates }) => {
   if (!isOpen) return null;
 
   return (
@@ -33,7 +35,7 @@ export const AboutModal: React.FC<AboutModalProps> = ({ isOpen, onClose }) => {
           <div className="flex items-center gap-3">
             <span className="px-2.5 py-1 rounded-full text-[11px] font-mono font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              v1.1.3 Stable
+              v1.2.3 Stable
             </span>
             <button
               onClick={onClose}
@@ -53,7 +55,7 @@ export const AboutModal: React.FC<AboutModalProps> = ({ isOpen, onClose }) => {
               Made by <span className="text-slate-100 font-medium">J Daniel Wonderson</span> (Creator & Architect)
             </span>
             <span className="text-[10px] font-mono text-slate-500">
-              TeleCloud v1.1.3
+              TeleCloud v1.2.3
             </span>
           </div>
 
@@ -165,8 +167,22 @@ export const AboutModal: React.FC<AboutModalProps> = ({ isOpen, onClose }) => {
 
         {/* Footer */}
         <div className="p-4 border-t border-slate-800/80 bg-vault-950/70 flex items-center justify-between shrink-0">
-          <div className="text-[11px] text-slate-400 font-mono">
-            <span>© 2026 J Daniel Wonderson • All rights reserved</span>
+          <div className="flex items-center gap-3">
+            <span className="text-[11px] text-slate-400 font-mono hidden sm:inline">
+              © 2026 J Daniel Wonderson
+            </span>
+            {onCheckUpdates && (
+              <button
+                onClick={() => {
+                  onClose();
+                  onCheckUpdates();
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-cyan-400 text-xs font-semibold border border-slate-700/60 transition active:scale-95"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Check for Updates</span>
+              </button>
+            )}
           </div>
 
           <button

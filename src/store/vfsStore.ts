@@ -11,6 +11,8 @@ import {
   ActiveTransfer,
   TransferProgress,
   TransferProgressEvent,
+  ClipboardItem,
+  ClipboardState,
 } from '../types/vfs';
 
 // The native engine can emit a progress packet several times per second.  Keep
@@ -73,7 +75,17 @@ interface VFSState {
   deleteFile: (id: string, permanent?: boolean) => Promise<void>;
   deleteItem: (id: string, isFolder: boolean) => Promise<void>;
   moveItem: (id: string, isFolder: boolean, targetFolderId: string | null) => Promise<void>;
+  copyItem: (id: string, isFolder: boolean, targetFolderId: string | null) => Promise<void>;
   inspectFileChunks: (file: FileRecord | null) => Promise<void>;
+
+  // Clipboard (Copy / Cut / Paste)
+  clipboard: ClipboardState | null;
+  copySelectionToClipboard: () => void;
+  cutSelectionToClipboard: () => void;
+  copyItemToClipboard: (id: string, isFolder: boolean, name: string) => void;
+  cutItemToClipboard: (id: string, isFolder: boolean, name: string) => void;
+  clearClipboard: () => void;
+  pasteClipboard: (targetFolderId?: string | null) => Promise<void>;
 
   // UI State Controls
   setSearchQuery: (query: string) => void;
@@ -107,6 +119,7 @@ export const useVFSStore = create<VFSState>((set, get) => ({
   searchQuery: '',
   viewMode: 'grid',
   selectedIds: [],
+  clipboard: null,
   loadingVfs: false,
   vfsError: null,
 
@@ -116,14 +129,9 @@ export const useVFSStore = create<VFSState>((set, get) => ({
 
   previewFile: null,
   openPreview: (file: FileRecord | FileItem) => {
-    invoke('prepare_preview', { fileId: file.id }).catch(() => {});
     set({ previewFile: file });
   },
   closePreview: () => {
-    const cur = get().previewFile;
-    if (cur) {
-      invoke('cancel_preview', { fileId: cur.id }).catch(() => {});
-    }
     set({ previewFile: null });
   },
 
@@ -276,6 +284,91 @@ export const useVFSStore = create<VFSState>((set, get) => ({
       id,
       targetFolderId,
     });
+    await loadDirectory();
+  },
+
+  copyItem: async (id: string, isFolder: boolean, targetFolderId: string | null) => {
+    const { loadDirectory } = get();
+    await invoke(isFolder ? 'copy_folder' : 'copy_file', {
+      id,
+      targetFolderId,
+    });
+    await loadDirectory();
+  },
+
+  copySelectionToClipboard: () => {
+    const { selectedIds, files, folders } = get();
+    if (selectedIds.length === 0) return;
+
+    const items: ClipboardItem[] = [];
+    for (const id of selectedIds) {
+      const folder = folders.find((f) => f.id === id);
+      if (folder) {
+        items.push({ id: folder.id, isFolder: true, name: folder.name });
+        continue;
+      }
+      const file = files.find((f) => f.id === id);
+      if (file) {
+        items.push({ id: file.id, isFolder: false, name: file.name });
+      }
+    }
+
+    if (items.length > 0) {
+      set({ clipboard: { items, operation: 'copy' } });
+    }
+  },
+
+  cutSelectionToClipboard: () => {
+    const { selectedIds, files, folders } = get();
+    if (selectedIds.length === 0) return;
+
+    const items: ClipboardItem[] = [];
+    for (const id of selectedIds) {
+      const folder = folders.find((f) => f.id === id);
+      if (folder) {
+        items.push({ id: folder.id, isFolder: true, name: folder.name });
+        continue;
+      }
+      const file = files.find((f) => f.id === id);
+      if (file) {
+        items.push({ id: file.id, isFolder: false, name: file.name });
+      }
+    }
+
+    if (items.length > 0) {
+      set({ clipboard: { items, operation: 'cut' } });
+    }
+  },
+
+  copyItemToClipboard: (id: string, isFolder: boolean, name: string) => {
+    set({ clipboard: { items: [{ id, isFolder, name }], operation: 'copy' } });
+  },
+
+  cutItemToClipboard: (id: string, isFolder: boolean, name: string) => {
+    set({ clipboard: { items: [{ id, isFolder, name }], operation: 'cut' } });
+  },
+
+  clearClipboard: () => {
+    set({ clipboard: null });
+  },
+
+  pasteClipboard: async (targetFolderId?: string | null) => {
+    const { clipboard, currentFolderId, moveItem, copyItem, loadDirectory, clearClipboard } = get();
+    if (!clipboard || clipboard.items.length === 0) return;
+
+    const destination = targetFolderId !== undefined ? targetFolderId : currentFolderId;
+
+    for (const item of clipboard.items) {
+      if (clipboard.operation === 'cut') {
+        await moveItem(item.id, item.isFolder, destination);
+      } else {
+        await copyItem(item.id, item.isFolder, destination);
+      }
+    }
+
+    if (clipboard.operation === 'cut') {
+      clearClipboard();
+    }
     await loadDirectory();
   },
 

@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, RwLock as StdRwLock},
 };
+use tokio::sync::Mutex as TokioMutex;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use grammers_client::message::InputMessage;
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,7 @@ pub struct CloudSyncManager {
     keystore: Arc<Keystore>,
     cache_dir: PathBuf,
     bot_pool: Arc<StdRwLock<Option<Arc<BotPool>>>>,
+    sync_lock: Arc<TokioMutex<()>>,
 }
 
 impl CloudSyncManager {
@@ -80,7 +82,26 @@ impl CloudSyncManager {
             keystore,
             cache_dir,
             bot_pool: Arc::new(StdRwLock::new(None)),
+            sync_lock: Arc::new(TokioMutex::new(())),
         })
+    }
+
+    /// Safe fallback CloudSyncManager that operates with fallback temporary cache path
+    pub fn fallback(
+        db: Arc<DbManager>,
+        telegram: Arc<TelegramClientManager>,
+        keystore: Arc<Keystore>,
+    ) -> Self {
+        let cache_dir = std::env::temp_dir().join("telecloud_cache_fallback");
+        let _ = fs::create_dir_all(&cache_dir);
+        Self {
+            db,
+            telegram,
+            keystore,
+            cache_dir,
+            bot_pool: Arc::new(StdRwLock::new(None)),
+            sync_lock: Arc::new(TokioMutex::new(())),
+        }
     }
 
     /// Connects the BotPool instance for automatic cloud-restored bot registration
@@ -111,6 +132,7 @@ impl CloudSyncManager {
 
     /// Exports local VFS, Gzip compresses, uploads to TeleCloud_Vault_Node channel, and pins message
     pub async fn push_vfs_index(&self) -> Result<i64, AppError> {
+        let _lock = self.sync_lock.lock().await;
         let (folders, files, chunks) = self.db.export_vfs_snapshot()?;
 
         // Export active worker bots for cross-device synchronization
@@ -143,8 +165,8 @@ impl CloudSyncManager {
 
         let snapshot_json = serde_json::to_vec(&snapshot)?;
 
-        // Compress snapshot using Gzip
-        let gz_path = self.cache_dir.join(SNAPSHOT_FILE_NAME);
+        // Compress snapshot using Gzip to a unique temp file
+        let gz_path = self.cache_dir.join(format!("vfs_push_{}.db.gz", uuid::Uuid::new_v4()));
         {
             let file = File::create(&gz_path)?;
             let mut encoder = GzEncoder::new(file, Compression::default());
@@ -156,10 +178,16 @@ impl CloudSyncManager {
         let peer_ref = self.telegram.resolve_storage_channel_peer_ref().await?;
 
         // Upload compressed archive over Telegram MTProto
-        let uploaded = client
-            .upload_file(&gz_path)
-            .await
-            .map_err(|e| AppError::Telegram(format!("Failed to upload VFS snapshot: {e}")))?;
+        let uploaded = match client.upload_file(&gz_path).await {
+            Ok(u) => {
+                let _ = fs::remove_file(&gz_path);
+                u
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&gz_path);
+                return Err(AppError::Telegram(format!("Failed to upload VFS snapshot: {e}")));
+            }
+        };
 
         let caption = format!(
             "VFS_SYNC_SNAPSHOT | v{} | {} | sha256:{}",
@@ -182,9 +210,6 @@ impl CloudSyncManager {
             .await
             .map_err(|e| AppError::Telegram(format!("Failed to pin VFS snapshot message: {e}")))?;
 
-        // Clean up temporary local compressed file
-        let _ = fs::remove_file(&gz_path);
-
         // Update local database sync metadata
         self.db
             .set_config("last_synced_message_id", &msg_id.to_string())?;
@@ -197,6 +222,7 @@ impl CloudSyncManager {
 
     /// Pulls and merges remote pinned VFS snapshot if newer than local database
     pub async fn pull_vfs_index(&self, force: bool) -> Result<bool, AppError> {
+        let _lock = self.sync_lock.lock().await;
         let client = self.telegram.get_client().await?;
         let peer_ref = self.telegram.resolve_storage_channel_peer_ref().await?;
 
@@ -227,25 +253,31 @@ impl CloudSyncManager {
             .media()
             .ok_or_else(|| AppError::Telegram("Pinned snapshot message has no attached media".into()))?;
 
-        let download_path = self.cache_dir.join("remote_vfs_index.db.gz");
+        let download_path = self.cache_dir.join(format!("remote_vfs_{}.db.gz", uuid::Uuid::new_v4()));
 
         // Download snapshot archive
-        client
-            .download_media(&media, &download_path)
-            .await
-            .map_err(|e| AppError::Telegram(format!("Failed to download remote VFS snapshot: {e}")))?;
+        if let Err(e) = client.download_media(&media, &download_path).await {
+            let _ = fs::remove_file(&download_path);
+            return Err(AppError::Telegram(format!("Failed to download remote VFS snapshot: {e}")));
+        }
 
         // Decompress and parse
-        let decompressed_bytes = {
-            let file = File::open(&download_path)?;
-            let mut decoder = GzDecoder::new(file);
-            let mut buffer = Vec::new();
-            decoder.read_to_end(&mut buffer)?;
-            buffer
+        let decompressed_bytes = match File::open(&download_path) {
+            Ok(file) => {
+                let mut decoder = GzDecoder::new(file);
+                let mut buffer = Vec::new();
+                let res = decoder.read_to_end(&mut buffer);
+                let _ = fs::remove_file(&download_path);
+                if let Err(e) = res {
+                    return Err(AppError::Io(format!("Failed to decompress remote VFS snapshot: {e}")));
+                }
+                buffer
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&download_path);
+                return Err(AppError::Io(format!("Failed to open downloaded VFS snapshot: {e}")));
+            }
         };
-
-        // Remove temporary download file
-        let _ = fs::remove_file(&download_path);
 
         let snapshot: VfsCloudSnapshot = serde_json::from_slice(&decompressed_bytes)?;
 

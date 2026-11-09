@@ -57,6 +57,80 @@ class MainActivity : TauriActivity() {
         @Volatile
         private var lastOpenFailure: String? = null
 
+        @Volatile
+        private var uncaughtHandlerInstalled = false
+
+        object TeleCloudLogger {
+            private const val LOG_FILE_NAME = "telecloud_debug.log"
+            private const val MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024L // 5MB max
+            @Volatile
+            private var logFile: File? = null
+
+            fun init(context: Context) {
+                try {
+                    val dir = context.getExternalFilesDir(null) ?: context.filesDir
+                    val file = File(dir, LOG_FILE_NAME)
+                    if (file.exists() && file.length() > MAX_LOG_SIZE_BYTES) {
+                        try {
+                            val backup = File(dir, "telecloud_debug.old.log")
+                            if (backup.exists()) backup.delete()
+                            file.renameTo(backup)
+                        } catch (_: Exception) {}
+                    }
+                    logFile = file
+                    log("TeleCloudApp", "=== TeleCloud Logger Initialized (v1.2.3) ===")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to initialize TeleCloudLogger", e)
+                }
+            }
+
+            fun log(tag: String, message: String) {
+                val timestamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+                    .format(java.util.Date())
+                val line = "[$timestamp] [$tag] $message\n"
+                Log.d(tag, message)
+                try {
+                    logFile?.let { f ->
+                        synchronized(this) {
+                            FileOutputStream(f, true).use { out ->
+                                out.write(line.toByteArray(Charsets.UTF_8))
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            fun getLogPath(): String {
+                return logFile?.absolutePath ?: "/storage/emulated/0/Android/data/com.telecloud.app/files/telecloud_debug.log"
+            }
+
+            fun readRecentLogs(): String {
+                return try {
+                    val f = logFile ?: return "Log file not initialized."
+                    if (!f.exists()) return "Log file does not exist yet."
+                    val text = f.readText(Charsets.UTF_8)
+                    if (text.length > 50000) {
+                        text.substring(text.length - 50000)
+                    } else {
+                        text
+                    }
+                } catch (e: Exception) {
+                    "Error reading log file: ${e.message}"
+                }
+            }
+        }
+
+        @JvmStatic
+        fun logToFile(tag: String, message: String) {
+            TeleCloudLogger.log(tag, message)
+        }
+
+        @JvmStatic
+        fun getLogFilePath(): String = TeleCloudLogger.getLogPath()
+
+        @JvmStatic
+        fun getRecentLogs(): String = TeleCloudLogger.readRecentLogs()
+
         init {
             try {
                 System.loadLibrary("telecloud_vault_lib")
@@ -94,12 +168,15 @@ class MainActivity : TauriActivity() {
         }
 
         @JvmStatic
-        fun openNativePlayer(url: String, title: String) {
+        @JvmOverloads
+        fun openNativePlayer(url: String, title: String, bitrateBps: Long = 0L, throughputRatio: Float = 1.0f) {
             val ctx = instance ?: return
             try {
                 val intent = Intent(ctx, NativePlayerActivity::class.java).apply {
-                    putExtra("STREAM_URL", url)
-                    putExtra("TITLE", title)
+                    putExtra(NativePlayerActivity.EXTRA_STREAM_URL, url)
+                    putExtra(NativePlayerActivity.EXTRA_TITLE, title)
+                    putExtra(NativePlayerActivity.EXTRA_BITRATE_BPS, bitrateBps)
+                    putExtra(NativePlayerActivity.EXTRA_THROUGHPUT_RATIO, throughputRatio)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 ctx.startActivity(intent)
@@ -142,6 +219,42 @@ class MainActivity : TauriActivity() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "scanMediaFile error: ${e.message}", e)
+            }
+        }
+
+        @JvmStatic
+        fun installApk(path: String) {
+            val ctx = instance ?: return
+            try {
+                val file = File(path)
+                if (!file.exists()) {
+                    Log.e(TAG, "installApk: file does not exist at $path")
+                    return
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    if (!ctx.packageManager.canRequestPackageInstalls()) {
+                        val manageIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                            data = Uri.parse("package:${ctx.packageName}")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        ctx.startActivity(manageIntent)
+                    }
+                }
+
+                val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                    ctx,
+                    "${ctx.packageName}.fileprovider",
+                    file
+                )
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(apkUri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                ctx.startActivity(intent)
+                Log.i(TAG, "installApk: launched package installer for $path")
+            } catch (e: Exception) {
+                Log.e(TAG, "installApk failed: ${e.message}", e)
             }
         }
 
@@ -573,12 +686,10 @@ class MainActivity : TauriActivity() {
         private fun stopForegroundServiceSafely(ctx: Context) {
             try {
                 foregroundServiceStartRequested = false
-                if (TransferForegroundService.isRunning) {
-                    val intent = Intent(ctx, TransferForegroundService::class.java).apply {
-                        action = TransferForegroundService.ACTION_STOP
-                    }
-                    ctx.startService(intent)
+                val intent = Intent(ctx, TransferForegroundService::class.java).apply {
+                    action = TransferForegroundService.ACTION_STOP
                 }
+                ctx.startService(intent)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed stopping foreground service: ${e.message}", e)
             }
@@ -709,7 +820,11 @@ class MainActivity : TauriActivity() {
 
         @JvmStatic
         fun requestAppPermissionsStatic() {
-            instance?.requestAppPermissions()
+            instance?.let { act ->
+                act.runOnUiThread {
+                    act.requestAppPermissions()
+                }
+            }
         }
 
         /** Refresh the foreground-service notification after Android has
@@ -768,10 +883,26 @@ class MainActivity : TauriActivity() {
         instance = this
         appContext = applicationContext
 
+        // 1. Initialize persistent debug logger
+        TeleCloudLogger.init(applicationContext)
+
+        // 2. Install uncaught exception handler to capture all runtime crashes to disk (once only)
+        if (!uncaughtHandlerInstalled) {
+            uncaughtHandlerInstalled = true
+            val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+            Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+                val stack = Log.getStackTraceString(throwable)
+                TeleCloudLogger.log("FATAL_CRASH", "Uncaught exception on thread [${thread.name}]: $stack")
+                Log.e(TAG, "FATAL CRASH: $stack")
+                previousHandler?.uncaughtException(thread, throwable)
+            }
+        }
+
         try {
             registerAppInstance()
+            TeleCloudLogger.log("INIT", "MainActivity registered with native library")
         } catch (e: Throwable) {
-            Log.e(TAG, "registerAppInstance native call notice: ${e.message}")
+            TeleCloudLogger.log("INIT", "registerAppInstance native call notice: ${e.message}")
         }
 
         createNotificationChannel()
@@ -851,15 +982,16 @@ class MainActivity : TauriActivity() {
         }
 
         if (permissionsToRequest.isNotEmpty()) {
-            Log.d(TAG, "Requesting runtime permissions: $permissionsToRequest")
+            TeleCloudLogger.log("PERMS", "Requesting runtime permissions: $permissionsToRequest")
             ActivityCompat.requestPermissions(
                 this,
                 permissionsToRequest.toTypedArray(),
                 PERMISSION_REQUEST_CODE
             )
         }
+    }
 
-        // 3. Battery Optimization Exemption for continuous background transfers without throttling
+    fun requestBatteryOptimizationExemption() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val powerManager = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
             if (powerManager != null && !powerManager.isIgnoringBatteryOptimizations(packageName)) {
